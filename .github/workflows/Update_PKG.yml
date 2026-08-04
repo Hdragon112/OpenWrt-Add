@@ -174,8 +174,8 @@ jobs:
 
       - name: Commit file
         run: |
-          git config --global user.email simonsqiu@foxmail.com
-          git config --global user.name SimonsQiu
+          git config --global user.email noodles@163.com
+          git config --global user.name Hdragon112
           git add .
           git commit -m "Update `date +%Y/%m/%d\ %H:%M:%S\ %Z`" -a
         continue-on-error: true
@@ -183,14 +183,14 @@ jobs:
       - name: Push changes
         uses: ad-m/github-push-action@master
         with:
-          github_token: ${{secrets.GITHUB_TOKEN}}
+          github_token: ${{secrets.noodles_TOKEN}}
           branch: master
         continue-on-error: true
 
       - name: Cleanup Workflow Logs
         uses: Mattraks/delete-workflow-runs@main
         with:
-          token: ${{secrets.GITHUB_TOKEN}}
+          token: ${{secrets.noodles_TOKEN}}
           repository: ${{ github.repository }}
           retain_days: 3
         continue-on-error: true
