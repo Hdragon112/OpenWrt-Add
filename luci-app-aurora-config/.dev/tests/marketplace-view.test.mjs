@@ -106,6 +106,87 @@ test("gallery view: apply flow calls hub_apply and polls get_hub_status like pol
   assert.match(src, /1500/, "missing 1.5s poll interval");
 });
 
+// header.ut renders the whole look server-side -- it readfile()s the font CSS
+// into the document and stamps every image URL with icon_cache_version -- so
+// all of it is evaluated once, at document load. Updating the banner in place
+// leaves the user looking at the theme they just replaced.
+test("gallery view: a finished online apply reloads the page, not just the banner", async () => {
+  const src = await readFile(SRC, "utf8");
+  const doneBranch = src.match(
+    /status\.state === "done"\)\s*\{([\s\S]*?)\}\s*else if/,
+  );
+  assert.ok(doneBranch, "missing the done branch of the apply poll");
+  assert.ok(
+    doneBranch[1].includes("window.location.reload"),
+    "a completed apply must reload -- otherwise the page still shows the previous theme",
+  );
+});
+
+// 审核和「身份没备份」是两件无关的事。拼成一条 msgid,加一个维度就翻一倍。
+test("gallery view: the publish notice keeps its two dimensions apart", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.ok(
+    src.includes("Published. Its images are queued for review"),
+    "a publish that uploaded images must say they are queued",
+  );
+  assert.ok(
+    !/Published\. Your creator identity/.test(src),
+    "the identity warning must stand alone, not be fused into the Published string",
+  );
+  assert.ok(
+    src.includes("Your creator identity lives only on this router"),
+    "the identity warning must survive as its own msgid",
+  );
+});
+
+// 作者发布完会立刻去商店找自己的作品。审核中的作品不在那儿,而这一行是
+// 唯一能解释「它去哪了」的地方 —— 没有它,发布成功读起来就是发布失败。
+test("gallery view: my-shares explains a review state, and stays silent otherwise", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.match(src, /const reviewNoteFor\s*=/, "missing the review-note helper");
+  assert.ok(
+    src.includes('status === "pending"'),
+    "a queued share must say it is in review",
+  );
+  assert.ok(
+    src.includes('status === "rejected"'),
+    "a rejected share must say its images were turned down",
+  );
+  // 正常态不出声:helper 必须有一条 return null 的路径,而不是给每种状态都
+  // 造一行字。
+  assert.match(
+    src.slice(src.indexOf("const reviewNoteFor")),
+    /return null;/,
+    "none/approved must render no note at all",
+  );
+  assert.ok(
+    src.includes("reviewNoteFor(item.assets_status)"),
+    "buildMyShareRow must consult the helper",
+  );
+});
+
+// rejectConfig 删掉待审的 assets 行和 R2 对象后把 assets_status 置为
+// 'rejected' —— 那条配置一张图都不剩了,徽章却还在说它带着素材。
+test("gallery view: only assets that cleared review earn the card badge", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.ok(
+    src.includes('item.assets_status === "approved"'),
+    "the card badge must key off approved, not merely non-none",
+  );
+  assert.ok(
+    !/assets_status\s*&&\s*item\.assets_status\s*!==\s*"none"/.test(src),
+    "the non-none badge test would keep badging a rejected config",
+  );
+  assert.ok(
+    src.includes('if (status !== "approved") return null;'),
+    "buildLegacyCardTiles must narrow to approved too",
+  );
+  assert.ok(
+    !/status\s*===\s*"none"\)\s*return null/.test(src),
+    "the old none-only guard must be gone, not merely shadowed",
+  );
+});
+
 test("gallery view: external toolbar URLs are surfaced in plaintext before applying", async () => {
   const src = await readFile(SRC, "utf8");
   assert.match(src, /toolbar/);
@@ -113,12 +194,88 @@ test("gallery view: external toolbar URLs are surfaced in plaintext before apply
   assert.ok(src.includes("createTextNode"), "external URLs must render via textContent, not innerHTML");
 });
 
-test("gallery view: rollback banner reads hub_applied and offers callHubRestore", async () => {
+// 横幅没了。「正在使用什么」由卡上的钩子回答,「怎么回去」由「我的配置」那张
+// 卡回答 —— 两个问题各有归属,顶部不需要再压一条把其中一个说第二遍。
+test("store view: the banner and the standing rollback button are gone", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.ok(!src.includes("renderBanner"), "renderBanner must be gone");
+  assert.ok(!src.includes("aurora-hub-banner"), "the banner element must be gone");
+  assert.ok(!src.includes("aurora-store-applied"), "the banner styles must be gone");
+  assert.ok(
+    !/_\("Restore previous configuration"\)/.test(src),
+    "rolling back is clicking your own card, not a button of its own",
+  );
+});
+
+test("store view: rolling back still goes through callHubRestore, from the card", async () => {
   const src = await readFile(SRC, "utf8");
   assert.match(src, /require uci/);
-  assert.match(src, /hub_applied/);
   assert.ok(src.includes("callHubRestore"), "missing callHubRestore usage");
   assert.ok(src.includes("window.location.reload"), "missing reload after restore");
+  assert.match(
+    src,
+    /apply: \(\) => confirmRestore\(\)/,
+    "the My-configuration card's apply action is the rollback",
+  );
+  // 引号内的才算读取:注释里提到它是允许的,那句话正是在解释为什么不再读。
+  assert.ok(
+    !/"hub_applied"/.test(src),
+    "matching must not read hub_applied any more -- it holds a name, not an id",
+  );
+});
+
+// 三类卡的选中态出自同一个比较。社区卡曾经写死 current:false,所以它永远不可能
+// 被选中 —— 那正是应用了社区主题、钩子却留在内置卡上的原因之一。
+test("store view: every card's tick comes from active_source plus modified", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.match(src, /callHubLocalState/);
+  assert.match(src, /activeSource === "builtin:" \+ preset\.id/);
+  assert.match(src, /activeSource === "hub:" \+ item\.id/);
+  assert.ok(
+    !/current: false/.test(src),
+    "a community card must be able to hold the tick",
+  );
+  assert.ok(
+    !/preset\.id === activePreset/.test(src),
+    "matching must not read active_preset any more",
+  );
+});
+
+// 「我的配置」和另两类卡共用同一套预览访问器 —— 三种卡,一套访问器,同一个外观
+// 不可能被画成两个样子。
+test("store view: the My-configuration card draws through the shared accessors", async () => {
+  const src = await readFile(SRC, "utf8");
+  const start = src.indexOf("const buildMineModel");
+  assert.ok(start !== -1, "buildMineModel is missing");
+  const block = src.slice(start, start + 900);
+  assert.match(block, /paletteOf\(/);
+  assert.match(block, /previewOpts\(/);
+  assert.match(block, /buildCardGlyphs\(/);
+  assert.match(block, /name: _\("My configuration"\)/);
+  assert.match(block, /current: modified/);
+});
+
+test("store view: one slot -- current uci when modified, the backup when not", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.match(src, /modified \? currentPreview\(\) : backupPreview/);
+  assert.match(
+    src,
+    /if \(!modified && !backupPreview\) return null;/,
+    "with nothing of your own and nothing to go back to, the section must not render",
+  );
+});
+
+test("store view: Mine comes before Built-in and Community", async () => {
+  const src = await readFile(SRC, "utf8");
+  const render = src.slice(src.indexOf("const renderContent"));
+  const mine = render.indexOf("buildMineGrid");
+  const builtin = render.indexOf("buildBuiltinGrid");
+  const online = render.indexOf("buildOnlineGrid");
+  assert.ok(mine !== -1, "the Mine section is missing");
+  assert.ok(
+    mine < builtin && mine < online,
+    "the card you are using should be the first one you see",
+  );
 });
 
 test("gallery view: apply/restore error copy stays result-only (no mechanism words)", async () => {
@@ -158,32 +315,28 @@ test("gallery view: the store survives a phone", async () => {
     src.includes("@media (hover:none){.aurora-store-acts{opacity:1;}}"),
     "the card's quick-apply button must be reachable without a hover",
   );
-
-  // ✓ 和它所在的那句话必须是同一个 flex item。分成两个的时候,窄屏上句子换行
-  // 到第二行,留一个光秃秃的 ✓ 吊在上面。
-  assert.match(
-    src,
-    /E\("span", \{ class: "msg" \}, \[\s*buildCurrentTick\(\),/,
-    "the banner tick must travel inside the sentence it belongs to",
-  );
 });
 
 test("gallery view: share panel and my-shares management (Task 8)", async () => {
   const src = await readFile(SRC, "utf8");
-  assert.ok(src.includes("callHubShare"), "missing callHubShare usage");
+  // 发布和更新都走 publishCurrentConfig:资产字节由浏览器直传,路由器只发
+  // 几 KB 的 begin/commit。原来的 callHubShare/callHubUpdate 把整张图 base64
+  // 塞进一个请求,uclient-fetch 走 TLS 推不动。
+  assert.ok(src.includes("publishCurrentConfig"), "missing publishCurrentConfig usage");
   assert.ok(src.includes("callHubMe"), "missing callHubMe usage");
-  assert.ok(src.includes("callHubUpdate"), "missing callHubUpdate usage");
   assert.ok(src.includes("callHubDelete"), "missing callHubDelete usage");
   assert.ok(src.includes("confirmDelete"), "missing confirmDelete reuse for delete confirms");
   assert.match(src, /require utils\.asset-upload as assetUpload/);
 });
 
-test("gallery view: updating a share resends the existing name (not id-only)", async () => {
+// 原意保留:更新必须带上那条分享的现有名字,否则 hub 的必填校验会拒掉它。
+// 现在这件事发生在打开表单的那一刻 —— 名字被填进输入框,提交时随之送出。
+test("gallery view: updating a share carries the existing name", async () => {
   const src = await readFile(SRC, "utf8");
   assert.match(
     src,
-    /callHubUpdate\(\s*item\.id,\s*item\.name,/,
-    "callHubUpdate must be called with item.name so the hub PUT's required-name check doesn't reject the update",
+    /const openUpdateForm = \(item\) => \{[\s\S]*?nameInput\.value = item\.name \|\| "";/,
+    "openUpdateForm must seed the name field so the update is not sent nameless",
   );
 });
 
@@ -323,7 +476,7 @@ test("gallery view: only a hub without preview degrades to assets_status", async
 // 问题所在。标签那一半是有意反转的:下划线选中态在深色主题下读作"没有",
 // 一块有底色的实心分段在任何主题色下都成立。
 // 见 docs/specs/2026-08-04-theme-store-visual-redesign.md 的"明确反转"一节。
-test("gallery view: a two-row header with a segmented filter row", async () => {
+test("gallery view: a one-row header with a segmented filter row", async () => {
   const src = await readFile(SRC, "utf8");
   assert.match(src, /class: "cbi-input-text"/, "search must stay a standard LuCI input");
   assert.ok(!src.includes("🔍"), "emoji glyph must go");
@@ -346,6 +499,19 @@ test("gallery view: a two-row header with a segmented filter row", async () => {
   );
   assert.match(src, /const buildSectionTitle = /, "section subtitle builder missing");
   assert.match(src, /const renderTabLabel = /, "tab label/count builder missing");
+
+  // 一行,不是两行:tabs、弹性间隔、搜索框是同一个 .aurora-store-head 的三个
+  // 子元素。之前搜索框自己占一行,而它左边什么都没有,那一整条就是空白。
+  assert.match(
+    src,
+    /const headEl = E\(\s*"div",\s*\{ class: "aurora-store-head" \},\s*\[\s*tabsEl,\s*E\("span", \{ class: "sp" \}\),\s*searchInput,/,
+    "tabs, spacer and search must sit in one .aurora-store-head row, in that order",
+  );
+  // margin-top 会把胶囊组从搜索框的中线上推开 —— 行距归 .aurora-store-head 管。
+  assert.ok(
+    !/\.aurora-store-filters\{[^}]*margin-top/.test(src),
+    "the filter pills must not carry their own top margin inside the shared row",
+  );
 });
 
 test("gallery view: sharing says what gets shared, inline rather than in a modal", async () => {
@@ -359,8 +525,41 @@ test("gallery view: sharing says what gets shared, inline rather than in a modal
   // 清单来自本机 uci,不是新的 rpcd 调用
   assert.match(src, /uci\.get\("aurora", "theme", "logo_svg"\)/);
   assert.match(src, /const loginBgFilename = /);
-  // 体积是机制信息,不进界面
-  assert.ok(!/KB|bytes|filesize/i.test(src), "no byte counts in the UI");
+  // 图片体积仍然是机制信息:一张 logo 多大改变不了任何人的决定,写出来只是噪音。
+  // 它们照旧只说"Included"。
+  assert.match(src, /rows\.push\(\{ label: label, detail: _\("Included"\) \}\)/);
+});
+
+// 字体是这条规则唯一的例外,而且是被真实后果逼出来的:一份覆盖中文的 woff2
+// 动辄好几 MB,落在与软件包共用的可写分区上,在小 flash 设备上这就是"能不能
+// 应用"本身。不写体积,用户要到刷不动包的时候才知道。
+test("gallery view: font assets are the one place a size belongs", async () => {
+  const src = await readFile(SRC, "utf8");
+  // 发布侧:我要发出去的这份字体有多大。
+  assert.match(src, /sharedFonts\.forEach\(/);
+  assert.match(src, /_\("Uploaded with the theme, %s"\)\.format\(/);
+  // 使用侧:我要接下来的这份字体有多大,存在哪,升级后还在不在。
+  assert.match(src, /asset\.kind === "font_sans" \|\| asset\.kind === "font_mono"/);
+  assert.match(src, /Includes %s of font files/);
+  assert.match(src, /writable partition/);
+  assert.match(src, /firmware upgrade/);
+});
+
+// 字体和图标不是一回事:自己画的 logo 是自己的,而一份字体绝大多数情况下是
+// 别人的作品,多数商业授权明确不允许再分发。这句话必须在按下发布之前就在
+// 眼前 —— 而且只在真的要发字体时才出现,否则它就成了人人都学会跳过的噪音。
+test("gallery view: publishing a font asks about redistribution rights", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.match(src, /if \(sharedFonts\.length\)/);
+  assert.match(src, /right to redistribute it/);
+  assert.match(src, /commercial font licences do not allow it/);
+});
+
+// 版权这件事两边都要说,但方向相反:发布面板问「你有权发吗」,详情抽屉只能
+// 说「这不是商店的字体,授权没人核实过」—— 说得更满就是替上传者担保。
+test("gallery view: the drawer says the licence is unverified", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.match(src, /does not verify its licence/);
 });
 
 test("gallery view: a re-render must not destroy a half-typed share", async () => {
@@ -796,7 +995,9 @@ test("gallery load() waits on nothing but local sources", async () => {
 
 test("gallery paints from cache first, then goes to the network", async () => {
   const src = await readFile(SRC, "utf8");
-  const tail = src.slice(src.lastIndexOf("renderBanner();"));
+  // 锚点是首屏挂载前的最后一件事:从缓存取一份列表先画上。横幅没了之后
+  // renderBanner() 不再能当锚。
+  const tail = src.slice(src.lastIndexOf("hubApi.listCache.getStale()"));
   assert.ok(tail.includes("meCache.getStale"), "my shares must paint from cache");
   assert.ok(tail.includes("appendChild"), "the tail should mount the DOM");
   // 顺序要求:两个请求都在 DOM 挂载之后
@@ -918,45 +1119,52 @@ test("identity card: names the router's creator, and carries back-up / rename / 
   assert.equal(renameSites, 1, "rename must have exactly one entry point");
 });
 
-test("publishing has exactly one persistent entry point", async () => {
+// 这一条原先钉的是"三处入口用同一个词"。三处已经一起删了:发布的起点搬到
+// 主题工作台,商店只负责逛和管。它现在钉的是"零个" —— 同一条回归线,更严。
+test("publishing has no entry point on this page at all", async () => {
   const src = await readFile(SRC, "utf8");
 
-  // 页头按钮复用发布面板的标题措辞 —— 点它打开的面板就叫这个名字。
   assert.ok(
     !src.includes('_("Share My Configuration")'),
     "the header button must stop being a second, differently-worded verb",
   );
 
-  // 常驻的页内按钮没了。剩下三处用同一个词:页头按钮、面板标题、以及空态
-  // 引导卡里那个 —— 引导卡与作品列表互斥,不是第四个常驻入口。
   const publishLabels =
     (src.match(/_\("Publish current configuration"\)/g) || []).length;
-  assert.equal(
-    publishLabels,
-    3,
-    "expected the header button, the panel heading and the empty-state CTA",
-  );
+  assert.equal(publishLabels, 0, "every publish entry point moved to the studio");
 
-  assert.match(src, /shareOpen = true;\s*selectTab\("mine"\);/);
+  // 页头那颗按钮连同它切标签的副作用一起没了。
+  assert.ok(
+    !/shareOpen = true;\s*selectTab\("mine"\);/.test(src),
+    "the header button's tab-switching side effect should be gone with it",
+  );
 });
 
-test("my-shares empty state onboards instead of demanding an import", async () => {
+// 原先这里分两种空态:没身份的给引导卡,有身份零作品的给一句话。改版之后
+// 两者要说的下一步完全相同(去工作台),所以合成一句。引导卡不再是发布入口,
+// 那颗按钮是路标 —— 它把人送走,不在这一页发起任何事。
+test("my-shares empty state points at the studio instead of publishing", async () => {
   const src = await readFile(SRC, "utf8");
 
   assert.ok(src.includes('_("Nothing shared yet")'));
   assert.ok(
     src.includes(
-      '_("Publish this router\'s whole appearance to the store and anyone can apply it in one click. Publishing creates your creator identity automatically.")',
+      '_("Sharing starts in the design studio: make the appearance what you want there, then publish from that page.")',
     ),
   );
   assert.ok(
     src.includes('_("Shared on another router before? Restore my identity")'),
   );
-  assert.ok(src.includes('_("Publish your current configuration and it shows up here.")'));
-
-  // 引导卡只在“连身份都还没有”时出现;已有身份、零作品是另一句话。
-  assert.match(src, /if \(!profile\.id\) \{/);
   assert.match(src, /class: "aurora-store-empty"/);
+
+  // 两种空态合并了:不再按 profile.id 分叉。
+  assert.ok(
+    !/if \(!profile\.id\) \{/.test(src),
+    "the two empty states now say the same next step and were merged",
+  );
+  assert.ok(
+    !src.includes('_("Publish your current configuration and it shows up here.")'),
+  );
 
   // 旧的那句“或者导入创作者密钥”彻底消失,连同两个旧按钮标签。
   assert.ok(
@@ -1014,4 +1222,51 @@ test("gallery: the tab strip names the page, so the head carries no heading", as
   // The spacer is what pushes search and share to the right; without the
   // heading it is the first child, and it still has to be there.
   assert.match(src, /class: "sp"/);
+});
+
+// 三处发布入口(页头按钮、面板标题、空态卡按钮)说的是同一句话,而且面板开着
+// 的时候下面还在劝你开面板。一次删干净:商店从此只干两件事 —— 逛别人的、
+// 管自己的,发布的起点在主题工作台。
+test("marketplace: no publish button anywhere on this page", async () => {
+  const src = await readFile(srcPath("view/aurora/marketplace.js"), "utf8");
+  assert.ok(!/cbi-button-add/.test(src), "the header publish button (and its CSS) should be gone");
+  assert.ok(
+    !/_\("Publish current configuration"\)/.test(src),
+    "the copy that named three separate entry points should be gone",
+  );
+  assert.match(src, /_\("Go to the design studio"\)/);
+});
+
+// 意图优先,状态兜底:用户上一秒刚在工作台点了"分享到商店",这句话不该被
+// "你已经发过东西了"盖掉。
+test("marketplace: intent beats state when deciding what to show", async () => {
+  const src = await readFile(srcPath("view/aurora/marketplace.js"), "utf8");
+  assert.match(src, /URLSearchParams\(window\.location\.search\)/);
+  assert.match(src, /shareIntent/);
+  assert.match(src, /history\.replaceState/);
+});
+
+// 带意图进来又已经有作品时,只给一张空表单会让人发出第二条几乎一样的东西。
+// "更新"的语义本来就是"用当前配置替换商店里的它",起点同样在工作台 ——
+// 所以它和发布共用同一张表单,只差一个目标。
+test("marketplace: an author with works picks new-vs-update before publishing", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.match(src, /shareTarget/);
+  assert.match(src, /_\("Publish as a new one"\)/);
+  assert.match(src, /_\("Replace “%s”"\)/);
+  assert.match(src, /nameInput\.value = target\.name/);
+  // 列表里的"更新"不再弹确认框,而是跳回同一张表单、那条已选中
+  assert.ok(!/confirmUpdateShare/.test(src), "update now reuses the publish form");
+  assert.match(src, /openUpdateForm/);
+});
+
+// 一张 1.2MB 的图在慢上行的线路上要传十几秒。没有进度就是"卡死"。
+test("marketplace: a multi-second upload shows progress, not a frozen button", async () => {
+  const src = await readFile(SRC, "utf8");
+  assert.match(src, /renderShareProgress/);
+  assert.match(src, /_\("Uploading %s… %d%%"\)/);
+  assert.match(src, /asset_upload_failed/);
+  assert.match(src, /asset_unreadable/);
+  // 进度回调必须真的接上,否则上面那些字一次都不会显示
+  assert.match(src, /onProgress: renderShareProgress/);
 });
