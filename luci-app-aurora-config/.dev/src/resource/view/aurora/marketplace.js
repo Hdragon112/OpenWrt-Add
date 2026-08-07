@@ -47,20 +47,29 @@ const SWATCH_KEYS = ["bg", "surface", "text", "brand"];
 // ?v=TOKENS_ENGINE_VERSION to the token engine.
 const PRESETS_VERSION = "d685cb2b";
 
-// build_share_payload skips assets whose filename is still the factory one --
-// an unmodified slot means the user never customised it, so nothing is
-// uploaded. The manifest must skip exactly the same names, or it would
-// promise to share a logo that never leaves the box.
+// Filenames the theme package itself ships into
+// /www/luci-static/aurora/images. Nothing under one of these names is ever
+// uploaded: the receiving router already has those bytes, and an unmodified
+// slot means the user never customised it in the first place.
 //
-// This list is duplicated from root/usr/libexec/rpcd/luci.aurora (the case
-// statement in build_share_payload). tests/gallery-view.test.mjs asserts the
-// two stay identical.
-const FACTORY_ASSET_NAMES = [
+// The first five are the asset slots' factory defaults; the last four are the
+// icons header.ut's default floating toolbar points at, which matters now that
+// shortcut icons travel with a config -- a shortcut pointing at overview.svg
+// needs no upload at all, and letting it consume a toolbar_icon_<k> slot
+// number would shift every later icon by one on the receiving end.
+//
+// Duplicated from root/usr/libexec/rpcd/luci.aurora (is_theme_shipped_image).
+// tests/marketplace-view.test.mjs asserts the two stay identical.
+const THEME_SHIPPED_NAMES = [
   "logo.svg",
   "favicon.ico",
   "app-icon-192x192.png",
   "app-icon-512x512.png",
   "apple-touch-icon.png",
+  "network.svg",
+  "overview.svg",
+  "software.svg",
+  "system.svg",
 ];
 
 const loginBgFilename = (value) => {
@@ -74,7 +83,7 @@ const isSharedAssetName = (name) =>
   !!name &&
   name.indexOf("/") === -1 &&
   name.indexOf("..") === -1 &&
-  FACTORY_ASSET_NAMES.indexOf(name) === -1;
+  THEME_SHIPPED_NAMES.indexOf(name) === -1;
 
 // build_share_payload validates every toolbar item against the hub's own
 // limits and silently skips the ones that fail, then stops after 12 accepted
@@ -88,6 +97,12 @@ const isSharedAssetName = (name) =>
 // Duplicated from root/usr/libexec/rpcd/luci.aurora, build_share_payload:
 // the cap at line 631, the per-item checks at lines 637-660.
 const MAX_SHARED_TOOLBAR_ITEMS = 12;
+
+// 两条尺寸上限,只为了在发布面板上把"为什么这张没发出去"说清楚。真正的闸门在
+// rpcd(MAX_SHARED_IMAGE / MAX_SHARED_TOOLBAR_ICON)和 hub 的 ASSET_SIZE_LIMITS
+// 里,这里只是复述 —— tests/marketplace-view.test.mjs 盯着三处不许漂移。
+const MAX_SHARED_IMAGE = 2 * 1024 * 1024;
+const MAX_SHARED_TOOLBAR_ICON = 256 * 1024;
 
 // Mirrors has_control_char and the `tr -d '[:cntrl:]'` title pass: the title is
 // stripped and then measured, every other field is rejected outright.
@@ -167,12 +182,15 @@ const callApplyThemePreset = rpc.declare({
 // both a card (preview) and the drawer (full payload), and neither can
 // describe the same configuration differently.
 //
-// Three shapes have to be handled, newest first:
-//   1. `item.preview`   -- a list row from a hub with the projection
+// Two shapes have to be handled:
+//   1. `item.preview`   -- a list row, from browse or from /api/v1/me
 //   2. `item.payload`   -- a detail row (always complete)
-//   3. `item.palette`   -- a list row from a hub without the projection.
-//      DEPRECATED on the hub side and kept only so a new client still works
-//      against an old one.
+//
+// There used to be a third, `item.palette`, in a nested shape of its own. The
+// hub no longer emits it anywhere: /api/v1/me was its last producer and now
+// carries the same `preview` the browse list does. One set of colors, one
+// shape -- while there were two, a card and the hub's own site could draw the
+// same configuration differently depending on which one they read.
 const previewOf = (item) => {
   const preview = item && item.preview;
   return preview && typeof preview === "object" && !Array.isArray(preview)
@@ -194,7 +212,6 @@ const paletteOf = (item) => {
       }, {});
     return { light: pick("light"), dark: pick("dark") };
   }
-  if (item && item.palette) return item.palette;
   return { light: {}, dark: {} };
 };
 
@@ -235,6 +252,20 @@ const assetKindsOf = (item) =>
   assetsOf(item)
     .map((asset) => (asset && asset.kind) || "")
     .filter(Boolean);
+
+// 这些 kind 加起来有多大,没有体积信息就返回 0。列表行的 preview 投影刻意不带
+// size(一页 24 张卡,体积是决策信息不是浏览信息,见 hub 的 configs.js),所以
+// 卡片上自然拿到 0 并且不显示 —— 详情抽屉才有。
+const assetBytesOf = (item, kinds) =>
+  assetsOf(item).reduce(
+    (sum, asset) =>
+      asset && kinds.indexOf(asset.kind) !== -1
+        ? sum + (Number(asset.size) || 0)
+        : sum,
+    0,
+  );
+
+const sizeLabel = (bytes) => (bytes > 0 ? assetUpload.formatSize(bytes) : "");
 
 // Only logo_svg is ever fetched for display. login_bg stays a label:
 // /assets/:id/:kind streams the original image (capped at 2 MiB) and a full
@@ -341,15 +372,19 @@ const radiusLabel = (value) => {
   return tier ? tier.label : "";
 };
 
-const buildTile = (glyph, label, title) => {
+const buildTile = (glyph, label, title, meta) => {
   const glyphEl = E("span", { class: "g" });
   glyphEl.appendChild(
     typeof glyph === "string" ? document.createTextNode(glyph) : glyph,
   );
-  const el = E("span", { class: "aurora-store-tile" }, [
-    glyphEl,
-    E("span", {}, [document.createTextNode(label)]),
-  ]);
+  const children = [glyphEl, E("span", { class: "nm" }, [document.createTextNode(label)])];
+  // 体积跟在名字后面,弱化一档。这一格的 tile 说的是"这份配置带了一个 logo",
+  // 而体积说的是"下它要花多少" —— 后者才是站在小 flash 设备前要做的判断。
+  if (meta)
+    children.push(
+      E("span", { class: "mt" }, [document.createTextNode(meta)]),
+    );
+  const el = E("span", { class: "aurora-store-tile" }, children);
   if (title) el.setAttribute("title", title);
   return el;
 };
@@ -369,7 +404,9 @@ const buildTiles = (entries) =>
   E(
     "div",
     { class: "aurora-store-tiles" },
-    entries.map((entry) => buildTile(entry.glyph, entry.label, entry.title)),
+    entries.map((entry) =>
+      buildTile(entry.glyph, entry.label, entry.title, entry.meta),
+    ),
   );
 
 // Also the fallback for a configuration whose payload carries nothing beyond
@@ -449,6 +486,7 @@ const tileEntriesFor = (item) => {
       glyph: logoGlyph(logoUrlOf(item)),
       label: ASSET_LABELS.logo,
       title: _("Custom logo"),
+      meta: sizeLabel(assetBytesOf(item, ["logo_svg"])),
     });
 
   if (kinds.indexOf("login_bg") !== -1)
@@ -457,6 +495,7 @@ const tileEntriesFor = (item) => {
       glyph: "▣",
       label: ASSET_LABELS.loginBg,
       title: _("Custom login page background"),
+      meta: sizeLabel(assetBytesOf(item, ["login_bg"])),
     });
 
   if (kinds.some((kind) => SITE_ICON_KINDS.indexOf(kind) !== -1))
@@ -465,6 +504,7 @@ const tileEntriesFor = (item) => {
       glyph: "◐",
       label: ASSET_LABELS.siteIcon,
       title: _("Custom site icons"),
+      meta: sizeLabel(assetBytesOf(item, SITE_ICON_KINDS)),
     });
 
   if (kinds.some((kind) => APP_ICON_KINDS.indexOf(kind) !== -1))
@@ -473,6 +513,7 @@ const tileEntriesFor = (item) => {
       glyph: "◐",
       label: ASSET_LABELS.appIcon,
       title: _("Custom app icons"),
+      meta: sizeLabel(assetBytesOf(item, APP_ICON_KINDS)),
     });
 
   if (toolbar.length)
@@ -481,6 +522,7 @@ const tileEntriesFor = (item) => {
       glyph: "⌘",
       label: _("Toolbar %d").format(toolbar.length),
       title: _("Floating toolbar shortcuts"),
+      meta: sizeLabel(assetBytesOf(item, TOOLBAR_ICON_KINDS)),
     });
 
   return entries;
@@ -530,14 +572,24 @@ const buildBundledTiles = (item) => {
 // 到底指向哪里。列表行来自 hub 的投影(preview.toolbar)则不带 url:那是详情
 // 路径的活,卡片不需要。
 //
-// SECURITY: 每个 toolbar 条目的 icon 存的是作者路由器上
-// /www/luci-static/aurora/images/ 里的文件名,而 hub 只批准六种资产
-// (logo_svg / login_bg / favicon_png / favicon_ico / pwa_icon_192 /
-// pwa_icon_512,见 root/usr/libexec/rpcd/luci.aurora 的 build_share_payload),
-// 快捷方式图标不在其中 —— 那些字节从来没有离开过作者的路由器。为 icon 拼一个
-// 路径就是画一张本机没有的图,还是用 hub 给的名字拼的。图标槽因此是一个中性
-// 占位符,而真正有用的两列是标题和目标。
+// SECURITY: toolbar 条目的 icon 存的是**作者路由器上**的文件名。为它拼一个
+// /luci-static/aurora/images/ 路径,画出来的是本机碰巧有的那张同名图,或者
+// 什么都没有 —— 两种都是在用 hub 给的名字读本机文件系统。所以那个字段一个
+// 字都不进 src。
+//
+// 图标本身现在跟着配置走了(toolbar_icon_<k>),而那条路径是安全的:字节由
+// hub 托管、过了审、按 sha256 校验,url 由 hubAssetUrl 按 hub 唯一可能产出的
+// 形状匹配后才拼 base —— 与 logo 走的是同一条。编号 k 在这里和 rpcd 的
+// nth_custom_toolbar_icon 里各算一次:按 payload.toolbar 顺序取「非空、非主题
+// 自带」的 icon 名去重,第 k 个不同的名字对应 toolbar_icon_<k>。
+//
+// 没有对应资产的条目(作者用的是主题自带图标,或者那张图没过审)退回中性
+// 占位符 —— 它一直就是这么画的。
 const SHORTCUT_GLYPH = "▫";
+
+const TOOLBAR_ICON_KINDS = [];
+for (let i = 0; i < MAX_SHARED_TOOLBAR_ITEMS; i++)
+  TOOLBAR_ICON_KINDS.push("toolbar_icon_" + i);
 
 // A hub field is JSON of whatever type the sender chose to send, not
 // whatever the schema promises: a bare number, an array, or an object whose
@@ -565,7 +617,44 @@ const isExternalShortcut = (url) => EXTERNAL_URL_RE.test(shortcutText(url));
 // replace() 都不会推进 lastIndex。
 const shortcutTarget = (url) => shortcutText(url).replace(EXTERNAL_URL_RE, "");
 
-const buildShortcutRow = (entry) => {
+// 快捷方式图标名 -> 它随配置发出来的那份资产的 url。编号规则与 rpcd 的
+// nth_custom_toolbar_icon 逐字对应:按 toolbar 顺序取「非空、非主题自带」的
+// icon 名,首次出现即去重编号,第 k 个不同的名字就是 toolbar_icon_<k>。
+//
+// 两端各算一次而不是把编号写进线格式,是因为 toolbar 条目的形状因此一个字段
+// 都不用加 —— 老 hub 存的配置、老客户端读的配置,全都照旧。
+const shortcutIconUrls = (item, toolbar) => {
+  const urls = {};
+  const order = [];
+  (Array.isArray(toolbar) ? toolbar : []).forEach((entry) => {
+    const icon = shortcutText(entry && entry.icon);
+    if (!icon || THEME_SHIPPED_NAMES.indexOf(icon) !== -1) return;
+    if (order.indexOf(icon) === -1) order.push(icon);
+  });
+  order.slice(0, MAX_SHARED_TOOLBAR_ITEMS).forEach((icon, index) => {
+    const entry = assetsOf(item).filter(
+      (asset) => asset && asset.kind === "toolbar_icon_" + index && asset.url,
+    )[0];
+    // hubAssetUrl 只认 hub 唯一可能产出的那种相对路径,别的一律给空串 ——
+    // 这个 url 来自 hub,和其它任何一个字段一样不可信。
+    const url = entry ? hubApi.hubAssetUrl(entry.url) : "";
+    if (url) urls[icon] = url;
+  });
+  return urls;
+};
+
+// SECURITY: <img src> only —— 与 themePreview.logoImage 同一条约束。图标画不
+// 出来就退回中性占位符,而不是留一个坏掉的图片框。
+const shortcutGlyph = (url) =>
+  url
+    ? themePreview.logoImage(
+        url,
+        document.createTextNode(SHORTCUT_GLYPH),
+        "width:14px;height:14px;object-fit:contain;display:block;",
+      )
+    : document.createTextNode(SHORTCUT_GLYPH);
+
+const buildShortcutRow = (entry, iconUrls) => {
   // Hub storage is JSON, and {"toolbar": [null]} is ordinary valid JSON --
   // Array.isArray passes, .map() still calls this with entry === null, and
   // every entry.x below would throw on that shape. Normalize once, up front,
@@ -575,8 +664,10 @@ const buildShortcutRow = (entry) => {
   const disabled = entry.enabled === "0";
   const external = isExternalShortcut(entry.url);
   const title = shortcutText(entry.title) + (disabled ? " " + _("(disabled)") : "");
+  const iconEl = E("span", { class: "ic" });
+  iconEl.appendChild(shortcutGlyph((iconUrls || {})[shortcutText(entry.icon)]));
   const children = [
-    E("span", { class: "ic" }, [document.createTextNode(SHORTCUT_GLYPH)]),
+    iconEl,
     E("span", { class: "nm" }, [document.createTextNode(title)]),
     E("span", { class: "to" }, [
       document.createTextNode(shortcutTarget(entry.url)),
@@ -588,13 +679,18 @@ const buildShortcutRow = (entry) => {
 };
 
 // 返回 [标题, 列表, ...注脚] 一整节,或者在这份配置没带快捷方式时返回 null。
-const buildShortcutList = (toolbar, layout) => {
+const buildShortcutList = (item, toolbar, layout) => {
   const items = Array.isArray(toolbar) ? toolbar : [];
   if (!items.length) return null;
 
+  const iconUrls = shortcutIconUrls(item, items);
   const nodes = [
     buildDetailHeading(_("Shortcuts %d").format(items.length)),
-    E("ul", { class: "aurora-store-sc" }, items.map(buildShortcutRow)),
+    E(
+      "ul",
+      { class: "aurora-store-sc" },
+      items.map((entry) => buildShortcutRow(entry, iconUrls)),
+    ),
   ];
 
   // 带了快捷方式却把工具栏整个关掉是合法的。不说的话这一节就是在承诺
@@ -779,11 +875,27 @@ const buildDetailBody = (item) => {
     buildLayoutRows(layout, typography),
   );
 
-  const shortcuts = buildShortcutList(payload.toolbar, layout);
+  const shortcuts = buildShortcutList(item, payload.toolbar, layout);
   if (shortcuts) children.push(...shortcuts);
 
   const bundled = buildBundledTiles(item);
   if (bundled) children.push(buildDetailHeading(_("Bundled content")), bundled);
+
+  // 每个 tile 上已经有自己的体积,这一句回答的是另一个问题:应用这套主题总共
+  // 要下多少。字体单独有一句(见下),因为它落在别的地方、也不随升级保留 ——
+  // 这一句只算图片。
+  const imageBytes = assetBytesOf(
+    item,
+    ["logo_svg", "login_bg"].concat(SITE_ICON_KINDS, APP_ICON_KINDS, TOOLBAR_ICON_KINDS),
+  );
+  if (imageBytes > 0)
+    children.push(
+      E(
+        "p",
+        { class: "aurora-store-dt-foot" },
+        _("Images: %s in total.").format(assetUpload.formatSize(imageBytes)),
+      ),
+    );
 
   // 字体是唯一一种应用后会长期占着路由器可写空间的资产。图片按槽位覆盖、
   // 几十上百 KB;而一份覆盖中文的字体动辄好几 MB,在小 flash 设备上这就是
@@ -1083,8 +1195,8 @@ const STORE_CSS =
   "color:var(--text-muted,#777);background:var(--surface-sunken,rgba(0,0,0,0.04));" +
   "border:1px solid var(--hairline,rgba(0,0,0,0.08));border-radius:7px;" +
   "padding:2px 8px 2px 3px;white-space:nowrap;max-width:100%;}" +
-  ".aurora-store-tile>span:last-child{min-width:0;overflow:hidden;" +
-  "text-overflow:ellipsis;}" +
+  ".aurora-store-tile .nm{min-width:0;overflow:hidden;text-overflow:ellipsis;}" +
+  ".aurora-store-tile .mt{flex:none;opacity:0.7;font-variant-numeric:tabular-nums;}" +
   ".aurora-store-tile .g{flex:none;display:grid;place-items:center;width:20px;height:20px;" +
   "border-radius:5px;background:var(--surface,#fff);color:var(--text,#111);" +
   "border:1px solid var(--hairline,rgba(0,0,0,0.08));font-size:0.9em;line-height:1;}" +
@@ -1093,6 +1205,7 @@ const STORE_CSS =
   ".aurora-store-sc li{display:flex;align-items:center;gap:10px;padding:8px 10px;" +
   "background:var(--surface-sunken,rgba(0,0,0,0.04));font-size:0.85em;}" +
   ".aurora-store-sc li.off{opacity:0.45;}" +
+  ".aurora-store-sc .ic img{width:14px;height:14px;object-fit:contain;display:block;}" +
   ".aurora-store-sc .ic{width:24px;height:24px;flex:none;display:grid;place-items:center;" +
   "border-radius:6px;background:var(--surface,#fff);color:var(--text-muted,#777);" +
   "border:1px solid var(--hairline,rgba(0,0,0,0.08));font-size:0.8em;line-height:1;}" +
@@ -1157,17 +1270,25 @@ const STORE_CSS =
   ".aurora-store-why summary{cursor:pointer;color:var(--brand,#333);" +
   "font-weight:600;list-style:none;}" +
   ".aurora-store-why summary::-webkit-details-marker{display:none;}" +
-  ".aurora-store-empty{margin-top:1em;padding:1.3em 1.4em;border-radius:12px;" +
-  "border:1px dashed var(--hairline,rgba(0,0,0,0.2));}" +
-  ".aurora-store-empty h4{margin:0 0 0.4em;font-size:1.02em;}" +
-  ".aurora-store-empty p{margin:0;color:var(--text-muted,#777);" +
-  "font-size:0.9em;max-width:56ch;}" +
-  ".aurora-store-empty .row{display:flex;gap:0.8em;align-items:center;" +
-  "flex-wrap:wrap;margin-top:1.1em;}" +
-  // 两处文字链:身份卡折叠说明里的"恢复身份",和空态引导卡里的那条。
-  ".aurora-store-why .lnk,.aurora-store-empty .lnk{" +
+  // 「还没发过」曾经是一张虚线卡:标题、一段说明、两个按钮。它整块删掉了 ——
+  // 那张卡劝人去别处发布,而发布入口现在就在它上面那条横幅上。空态回到商店
+  // 别处一直在用的写法(见 buildOnlineGrid 的 "No themes match your search."):
+  // 一行灰字,说完就完。
+  ".aurora-store-none{color:var(--text-muted,#777);font-size:0.9em;padding:1.2em 0.2em;}" +
+  // 身份卡上的"改名"和"恢复"。以前只有折叠说明里那一条文字链,而"恢复"同时
+  // 还在空态卡里出现了第二次 —— 两条都指向同一个对话框。现在只剩这里一处。
+  ".aurora-store-why .lnk,.aurora-store-idcard .lnk{" +
   "background:none;border:0;padding:0;cursor:pointer;font:inherit;" +
   "color:var(--brand,#333);text-decoration:underline;}" +
+  // 「我的配置」那条横幅。外框直接用 .aurora-store-share(发布面板的容器),
+  // 这里只多一个三列栅格:缩略图 / 说明 / 动作。窄屏塌成一列,动作排回一行。
+  ".aurora-store-mine{display:grid;grid-template-columns:200px 1fr auto;" +
+  "gap:1.2em;align-items:center;}" +
+  ".aurora-store-mine .sum{margin:0.35em 0 0;color:var(--text-muted,#777);" +
+  "font-size:0.88em;}" +
+  ".aurora-store-mine .acts{display:flex;flex-direction:column;gap:0.5em;}" +
+  "@media (max-width:700px){.aurora-store-mine{grid-template-columns:1fr;}" +
+  ".aurora-store-mine .acts{flex-direction:row;}}" +
   ".aurora-store-keybox{display:flex;align-items:center;gap:0.7em;margin:0.9em 0;" +
   "padding:0.7em 0.8em;border-radius:9px;" +
   "background:var(--surface-sunken,rgba(0,0,0,0.04));" +
@@ -1265,6 +1386,11 @@ return view.extend({
       // build_share_payload 打包时的同一个判断,所以发布面板上写着要发什么,
       // 线路上发的就是什么。名册预设不在其中 —— 接收端自己去下载。
       sharedFonts: (localState && localState.shared_fonts) || [],
+      // 同理,会随这份配置发出去的图片和快捷方式图标,带体积。发布面板过去
+      // 对图片只写一句 "Included" —— 而体积才是收到这份主题的人真正要拿来
+      // 做决定的东西,尤其是 flash 只剩一两 MB 的设备。
+      sharedImages: (localState && localState.shared_images) || [],
+      sharedToolbarIcons: (localState && localState.shared_toolbar_icons) || [],
     }));
   },
 
@@ -1277,6 +1403,8 @@ return view.extend({
     const backupPreview = loadData.backupPreview;
     const currentNav = loadData.navType;
     const sharedFonts = loadData.sharedFonts;
+    const sharedImages = loadData.sharedImages;
+    const sharedToolbarIcons = loadData.sharedToolbarIcons;
 
     const isCurrentBuiltin = (preset) =>
       !modified && activeSource === "builtin:" + preset.id;
@@ -1775,6 +1903,102 @@ return view.extend({
       return E("div", { class: "aurora-store-grid" }, [buildCard(model)]);
     };
 
+    // 同一份配置,两种画法,按它在哪一页出场。
+    //
+    // 「全部」页上它是可浏览的一组里的一张卡(buildMineGrid),和内置、社区
+    // 那两组同一种形状。「我的」页上它是主角,所以摊成一条横幅:一张 252px
+    // 的卡孤零零待在一个为 N 件作品准备的 auto-fill 网格里,后面拖着几格空白
+    // —— 而这一格永远只有一件,因为它就是当前 uci 的投影。
+    //
+    // 横幅换来的宽度不是留白,是清单:发出去到底带什么,连体积一起。那份清单
+    // 直接调 shareManifestRows(),发布面板用的是同一个函数 —— 不复制,否则以
+    // 后加一项配置要改两处,两处必然会长歪。
+    const buildMineBanner = () => {
+      const model = buildMineModel();
+      if (!model) return null;
+
+      const prev = E("div", { class: "aurora-store-prev" }, [
+        buildDuo(model.palette, model.opts),
+        E("span", { class: "aurora-store-dots" }, [buildDotRow(model.palette)]),
+      ]);
+      if (model.current) prev.appendChild(buildCurrentPin());
+
+      const nm = E("div", { class: "aurora-store-nm" }, [
+        document.createTextNode(_("My configuration")),
+        E(
+          "span",
+          { class: "aurora-store-pill " + (modified ? "ok" : "") },
+          modified ? _("In use") : _("Not in use"),
+        ),
+      ]);
+      if (model.glyphs) nm.appendChild(model.glyphs);
+
+      // 主动作跟着这条横幅代表的东西走,不是跟着按钮的可用性走。改过 ->
+      // 它就是屏幕上正在发生的样子,发布发的就是它。没改过 -> 它是被商店
+      // 主题盖掉之前那份备份,而 build_share_payload 打包的是当前 uci,不是
+      // 这张预览 —— 那时"发布"会发出一份和画面上不符的东西,所以这里根本
+      // 不给这个按钮,而不是把它置灰了事。
+      const acts = modified
+        ? [
+            E(
+              "button",
+              {
+                type: "button",
+                class: "btn cbi-button-action important",
+                click: () => openSharePanel(),
+              },
+              _("Share to the store"),
+            ),
+            E(
+              "button",
+              { type: "button", class: "cbi-button", click: () => model.open() },
+              _("Details"),
+            ),
+          ]
+        : [
+            E(
+              "button",
+              {
+                type: "button",
+                class: "btn cbi-button-action important",
+                click: () => confirmRestore(),
+              },
+              _("Apply"),
+            ),
+            E(
+              "button",
+              { type: "button", class: "cbi-button", click: () => model.open() },
+              _("Details"),
+            ),
+          ];
+
+      return E("div", { class: "aurora-store-share aurora-store-mine" }, [
+        E("div", { class: "aurora-store-share-prev" }, [prev]),
+        E("div", {}, [
+          nm,
+          E(
+            "p",
+            { class: "sum" },
+            modified
+              ? _("The look this router is wearing right now.")
+              : _("How this router looked before you applied a theme from the store."),
+          ),
+          // 抽屉里那排「随附内容」用的同一个 buildTiles。清单本身来自
+          // shareManifestRows() —— 发布面板的那一份,一字不差,所以横幅上
+          // 写着要发什么,点下去发的就是什么。
+          buildTiles(
+            shareManifestRows().map((row) => ({
+              glyph: "·",
+              label: row.label,
+              meta: row.detail,
+              title: row.label + " — " + row.detail,
+            })),
+          ),
+        ]),
+        E("div", { class: "acts" }, acts),
+      ]);
+    };
+
     // ------------------------------------------------------------------
     // My shares
 
@@ -1819,6 +2043,21 @@ return view.extend({
       shareOpen = true;
       nameInput.value = item.name || "";
       descInput.value = item.description || "";
+      renderContent();
+    };
+
+    // 同一张面板的另一个入口,来自「我的配置」横幅。openUpdateForm 进来时
+    // 选中了一条已有分享("用当前配置替换它"),这里什么都不选("发一份新的")。
+    //
+    // 这一页此前一个发布入口都没有 —— studio.js 的注释记着为什么:页头按钮、
+    // 面板标题、空态卡按钮三个入口同时在场,说的都是同一句话,于是一起删掉了。
+    // 这次只加回来一个,而且挂在被发布的那个对象上。工作台那个入口保留,两处
+    // 落到同一张表单。
+    const openSharePanel = () => {
+      shareTarget = "";
+      shareOpen = true;
+      nameInput.value = "";
+      descInput.value = "";
       renderContent();
     };
 
@@ -1906,18 +2145,45 @@ return view.extend({
       // and a "Name"/"Downloads" line above each would only stutter.
       // 状态挂在名字底下,不占一列:这张表刚在 390px 上修过溢出,第四列会让
       // 它重演。而状态本来就是在说这一件作品,贴着它的名字最省一次目光移动。
+      // 一行色点走在名字前面。/api/v1/me 现在带回和商店列表同一份 preview,
+      // 所以这几个色值和别人在商店里看到的这件作品是同一批 —— 作者不必靠
+      // 名字回忆哪件是哪件。
       const nameCell = E("td", { class: "td", style: "word-break:break-word;" }, [
+        E(
+          "span",
+          { style: "display:inline-flex;vertical-align:middle;margin-right:8px;" },
+          [buildDotRow(paletteOf(item))],
+        ),
         document.createTextNode(item.name || _("Untitled theme")),
       ]);
-      const note = reviewNoteFor(item.assets_status);
-      if (note) {
+
+      // 被下架的那一行:它不是错误,是这件作品此刻唯一的真相,而这里是作者
+      // 唯一会被告知的地方 —— 公开的浏览接口按设计不会再列出它。
+      //
+      // 不给按钮,两个都不给。更新一件已经不在商店里的作品没有意义;而删除
+      // 走的 hub_delete 要求 status='active'(见 hub 的 requireOwnedConfig),
+      // 对着已下架的调过去只会拿到 404,而 404 在 shell 那边只能报成"连不上
+      // 商店" —— 那正是这张表以前那个"删了还在"的老毛病的后半段。
+      const takenDown = item.status === "removed";
+      if (takenDown) {
         nameCell.appendChild(
           E(
             "div",
-            { style: "margin-top:2px;font-size:0.84em;color:" + note.color + ";" },
-            note.text,
+            { style: "margin-top:2px;font-size:0.84em;color:var(--warning);" },
+            _("Taken down — no longer in the store. Nothing you can do from here."),
           ),
         );
+      } else {
+        const note = reviewNoteFor(item.assets_status);
+        if (note) {
+          nameCell.appendChild(
+            E(
+              "div",
+              { style: "margin-top:2px;font-size:0.84em;color:" + note.color + ";" },
+              note.text,
+            ),
+          );
+        }
       }
 
       return E("tr", { class: "tr" }, [
@@ -1926,7 +2192,7 @@ return view.extend({
           document.createTextNode(formatDownloads(item.downloads)),
         ]),
         E("td", { class: "td cbi-section-actions" }, [
-          E("div", {}, [updateBtn, " ", deleteBtn]),
+          E("div", {}, takenDown ? [] : [updateBtn, " ", deleteBtn]),
         ]),
       ]);
     };
@@ -2144,6 +2410,12 @@ return view.extend({
               ),
             ]),
           ]),
+          // 身份的三个动作全在这一处。备份是实心的那个(没备份时),改名和
+          // 恢复是文字链 —— 它们不是这张卡要人做的事,只是要人找得到的事。
+          //
+          // 「恢复」以前有两个入口:折叠说明里一条,空态引导卡里又一条,同屏
+          // 可见,指向同一个对话框。空态卡整张删掉了,说明里那条也删了,只剩
+          // 这一个。
           E("div", { class: "acts" }, [
             E(
               "button",
@@ -2160,20 +2432,21 @@ return view.extend({
               { type: "button", class: "cbi-button", click: () => promptRename() },
               _("Rename"),
             ),
+            " ",
+            E(
+              "button",
+              { type: "button", class: "lnk", click: () => restoreIdentityPrompt() },
+              _("Restore…"),
+            ),
           ]),
         ]),
         E("details", { class: "aurora-store-why" }, [
           E("summary", {}, _("What is this? Where did it come from?")),
-          E("p", { style: "margin:0 0 0.6em;" }, [
+          E("p", { style: "margin:0;" }, [
             document.createTextNode(
               _("Created automatically the first time you publish — no sign-up, no password. It decides which configurations in the store are yours, and who can change or remove them. Backing it up saves an identity backup file; import that file after a reflash, or on a new router, and your work comes back to you."),
             ),
           ]),
-          E(
-            "button",
-            { type: "button", class: "lnk", click: () => restoreIdentityPrompt() },
-            _("Changed routers? Restore your identity"),
-          ),
         ]),
       ]);
     };
@@ -2289,50 +2562,28 @@ return view.extend({
     // The tab keeps the count of what is already published, so the number is
     // readable without opening the tab first.
     const renderMyShares = (items) => {
-      // 商店那边是软删除:一件作品删掉之后,/api/v1/me 仍然把它列出来,只是
-      // status 变成 "removed"。这是删除看起来"删不掉"的全部原因 —— 删成功了,
-      // 刷新一遍,那一行还在,于是用户再点一次,这次撞上 404,而 404 在 shell
-      // 那边只能报成"连不上商店"。这里滤掉,那一行就再也不会重新出现。
-      myShares = (items || []).filter((item) => item && item.status !== "removed");
+      // 这里曾经有一句 filter(status !== "removed")。当时商店的软删除让作者
+      // 自己删掉的作品继续出现在 /api/v1/me 里,只是 status 变成 removed ——
+      // 删成功了、刷新一遍那一行还在,用户再点一次就撞 404。滤掉是对的,代价
+      // 是被管理员下架的作品也一起被藏了,作者永远不知道自己被下架过。
+      //
+      // 现在 hub 那边分得清了(migration 0007 的 removed_by):作者自己删的根本
+      // 不再下发,而 status === "removed" 只剩一个意思 —— 被下架。所以这里不再
+      // 滤,那一行改由 buildMyShareRow 画成「已下架」。
+      myShares = (items || []).filter((item) => item);
       TABS.forEach(renderTabLabel);
       while (mySharesEl.firstChild) mySharesEl.removeChild(mySharesEl.firstChild);
       if (!myShares.length) {
-        // 没有意图就不摆表单 —— 表单是个重家伙,凭空占满一整页就是原先那种
-        // 冗余(一张劝你发布的卡,底下再跟一张让你发布的面板)。这里只给一块
-        // 路标。按钮是路标,不是发布控件:它把人送回工作台,不在这一页发起
-        // 任何事。两种空态(从没发过 / 全删光了)合成一句话,因为改版之后它们
-        // 要说的下一步完全相同。
+        // 曾经是一张虚线卡:标题、一段说明、一个"去工作台"按钮,外加第二条
+        // "恢复身份"链接。三样东西现在都没有理由存在了 —— 发布入口就在这一
+        // 屏上方那条横幅上,身份的恢复入口在身份卡里。剩下要说的只有一句:
+        // 这里以后会长出什么。
         mySharesEl.appendChild(
-          E("div", { class: "aurora-store-empty" }, [
-            E("h4", {}, _("Nothing shared yet")),
-            E("p", {}, [
-              document.createTextNode(
-                _("Sharing starts in the design studio: make the appearance what you want there, then publish from that page."),
-              ),
-            ]),
-            E("div", { class: "row" }, [
-              E(
-                "button",
-                {
-                  type: "button",
-                  class: "cbi-button",
-                  click: () => {
-                    window.location.href = L.url("admin/system/aurora/studio");
-                  },
-                },
-                _("Go to the design studio"),
-              ),
-              E(
-                "button",
-                {
-                  type: "button",
-                  class: "lnk",
-                  click: () => restoreIdentityPrompt(),
-                },
-                _("Shared on another router before? Restore my identity"),
-              ),
-            ]),
-          ]),
+          E(
+            "p",
+            { class: "aurora-store-none" },
+            _("Nothing shared yet. Publish the configuration above and it shows up here."),
+          ),
         );
         return;
       }
@@ -2346,14 +2597,8 @@ return view.extend({
           ...myShares.map((item) => buildMyShareRow(item)),
         ]),
       );
-      // 有作品的人也需要知道下一套从哪儿发 —— 这一页已经没有发布入口了。
-      mySharesEl.appendChild(
-        E(
-          "p",
-          { style: "font-size:0.84em;color:var(--text-subtle);margin:12px 0 0;" },
-          _("Want to publish another one? Set it up in the design studio and publish from there."),
-        ),
-      );
+      // 这里曾经跟着一句"想再发一套?去工作台发"。它存在的理由是这一页当时
+      // 没有发布入口 —— 现在这一屏上方就是那条横幅,再指一次路只是多一行字。
     };
 
     // ------------------------------------------------------------------
@@ -2409,37 +2654,47 @@ return view.extend({
         }),
       );
 
-      // The same five image slots build_share_payload walks, read by name so
-      // the keys stay next to the labels they produce. Two slots share the
-      // "Site Icon" label and two share "App Icon", so the list is
-      // de-duplicated by label -- naming either one twice would be wrong.
-      const images = [];
-      [
-        { name: uci.get("aurora", "theme", "logo_svg"), label: ASSET_LABELS.logo },
-        {
-          name: uci.get("aurora", "theme", "favicon_png"),
-          label: ASSET_LABELS.siteIcon,
-        },
-        {
-          name: uci.get("aurora", "theme", "favicon_ico"),
-          label: ASSET_LABELS.siteIcon,
-        },
-        {
-          name: uci.get("aurora", "theme", "pwa_icon_192"),
-          label: ASSET_LABELS.appIcon,
-        },
-        {
-          name: uci.get("aurora", "theme", "pwa_icon_512"),
-          label: ASSET_LABELS.appIcon,
-        },
-      ].forEach((slot) => {
-        if (isSharedAssetName(slot.name) && images.indexOf(slot.label) === -1)
-          images.push(slot.label);
+      // 图片这几行以前只写 "Included"。而对着这张清单要做的决定是「把这套
+      // 主题发出去」,对着商店详情页要做的决定是「把它装到我的路由器上」——
+      // 两个决定都要看体积,一张 1.8MB 的登录背景和一个 3KB 的 logo 不是一
+      // 回事。体积来自 rpcd 的 shared_images:问的是 build_share_payload 打包
+      // 时问的同一个函数,所以屏幕上说要发什么,线路上发的就是什么。
+      //
+      // 两个槽位共用 "Site Icon" 标签、两个共用 "App Icon",所以按标签合并 ——
+      // 同一个名字出现两次是错的。合并后的体积是这几个槽位的和。
+      const IMAGE_ROW_LABELS = {
+        logo_svg: ASSET_LABELS.logo,
+        favicon_png: ASSET_LABELS.siteIcon,
+        favicon_ico: ASSET_LABELS.siteIcon,
+        pwa_icon_192: ASSET_LABELS.appIcon,
+        pwa_icon_512: ASSET_LABELS.appIcon,
+        login_bg: ASSET_LABELS.loginBg,
+      };
+      const imageRows = [];
+      sharedImages.forEach((image) => {
+        const label = IMAGE_ROW_LABELS[image && image.kind];
+        if (!label) return;
+        const size = Number(image.size) || 0;
+        const existing = imageRows.filter((row) => row.label === label)[0];
+        // 超限的不与正常的合并:一行同时说"共 2.1 MB"和"太大发不出去"就没法读
+        // 了,而"哪一张太大"正是用户此刻唯一需要知道的事。
+        const oversized = image.oversized === true;
+        if (existing && existing.oversized === oversized) {
+          existing.size += size;
+          return;
+        }
+        imageRows.push({ label: label, size: size, oversized: oversized });
       });
-      if (isSharedAssetName(loginBgFilename(uci.get("aurora", "theme", "struct_login_bg"))))
-        images.push(ASSET_LABELS.loginBg);
-      images.forEach((label) =>
-        rows.push({ label: label, detail: _("Included") }),
+      imageRows.forEach((row) =>
+        rows.push({
+          label: row.label,
+          detail: row.oversized
+            ? _("Too large to share (%s; the store's limit is %s)").format(
+                assetUpload.formatSize(row.size),
+                assetUpload.formatSize(MAX_SHARED_IMAGE),
+              )
+            : _("Included, %s").format(assetUpload.formatSize(row.size)),
+        }),
       );
 
       // Anonymous toolbar_item sections have no stable index, so the array is
@@ -2456,6 +2711,35 @@ return view.extend({
             shortcuts === 1
               ? _("1 shortcut")
               : _("%d shortcuts").format(shortcuts),
+        });
+
+      // 快捷方式的图标以前只是个文件名跟着走,而那个文件只存在于这台路由器
+      // 上 —— 别人应用完,工具栏上就是一排空框。现在字节也跟着走,所以这里
+      // 要把它当成一份真的资产来交代:发几个、多大。
+      //
+      // 发不出去的那些单独说。图标只收 PNG 和 SVG(审核台只有这两条清洗
+      // 路径),超过 256 KiB 的也不发 —— 12 个槽位按图片的上限放行,光图标
+      // 就能把审核请求撑爆。这两种情况都不是错误,但沉默地少发一个图标,
+      // 用户只会在别人的截图里发现它没了。
+      const shippedIcons = sharedToolbarIcons.filter((icon) => icon && icon.shipped);
+      const droppedIcons = sharedToolbarIcons.filter((icon) => icon && !icon.shipped);
+      if (shippedIcons.length)
+        rows.push({
+          label: _("Shortcut Icons"),
+          detail: _("%d included, %s").format(
+            shippedIcons.length,
+            assetUpload.formatSize(
+              shippedIcons.reduce((sum, icon) => sum + (Number(icon.size) || 0), 0),
+            ),
+          ),
+        });
+      if (droppedIcons.length)
+        rows.push({
+          label: _("Shortcut Icons"),
+          detail: _("%d not shared — only PNG and SVG under %s travel with a theme").format(
+            droppedIcons.length,
+            assetUpload.formatSize(MAX_SHARED_TOOLBAR_ICON),
+          ),
         });
 
       return rows;
@@ -2556,6 +2840,12 @@ return view.extend({
       pwa_icon_512: ASSET_LABELS.appIcon,
       login_bg: ASSET_LABELS.loginBg,
     };
+    // 图标的 kind 带着槽位号(toolbar_icon_3),那是个内部编号,不是一个地方。
+    // 让它掉进下面那个 `|| info.kind` 的兜底,进度条上就会写着 "正在上传
+    // toolbar_icon_3…" —— 这个文件开头那条"机制词永不出现"的规矩说的正是它。
+    TOOLBAR_ICON_KINDS.forEach((kind) => {
+      ASSET_PROGRESS_LABELS[kind] = _("Shortcut Icons");
+    });
 
     // 一张 1.2MB 的图在慢上行的线路上要传十几秒,而那段时间里页面上唯一会动
     // 的东西就是这一行。没有它,等待读起来就是卡死。
@@ -3103,7 +3393,10 @@ return view.extend({
 
       // 排在最前面:正在用的那张卡应该第一眼看见。既没改过、又没有可回去的
       // 配置时整段不出现 —— 那时用户还没有属于自己的东西。
-      if (state.tab === "all" || state.tab === "mine") {
+      //
+      // 「全部」页上它是一张卡:那一页是拿来逛的,内置和社区也是网格,它跟着
+      // 一样才读得顺。「我的」页在下面单独处理 —— 那里它是主角,画成横幅。
+      if (state.tab === "all") {
         const mineGrid = buildMineGrid();
         if (mineGrid) {
           push(buildSectionTitle(_("Mine"), _("On this router only")));
@@ -3135,12 +3428,16 @@ return view.extend({
           push(buildSharePanel());
           return;
         }
-        const identityCard = buildIdentityCard();
-        if (identityCard) {
-          push(buildSectionTitle(_("My creator identity"), ""));
-          push(identityCard);
+        // 一屏两个标题,不是三个。身份曾经占着和作品同一级的一个 section ——
+        // 它是设施,不是目的,现在并进「我的分享」:这台路由器以谁的名义发布,
+        // 说的本来就是下面那张表里的东西归谁。
+        const banner = buildMineBanner();
+        if (banner) {
+          push(buildSectionTitle(_("Mine"), _("On this router only")));
+          push(banner);
         }
         push(buildSectionTitle(_("My Shares"), ""));
+        push(buildIdentityCard());
         push(mySharesEl);
       }
     };
