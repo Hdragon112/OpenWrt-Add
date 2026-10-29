@@ -50,7 +50,7 @@ sync_helloworld() {
             cp -f "$PATCH_DIR/dns2socks-Makefile" "$tmp_dir/openwrt_helloworld/dns2socks/Makefile"
         fi
 
-        rm -rf "$tmp_dir/openwrt_helloworld"/{luci-app-ssr-plus,luci-app-passwall,simple-obfs,lua-neturl,sing-box,luci-app-mihomo,mihomo,luci-app-nikki,nikki,luci-app-homeproxy,luci-app-openclash,luci-app-daed,daed,luci-app-dae,dae,v2ray-geodata}
+        rm -rf "$tmp_dir/openwrt_helloworld"/{luci-app-ssr-plus,luci-app-passwall,simple-obfs,lua-neturl,luci-app-mihomo,mihomo,luci-app-nikki,nikki,luci-app-homeproxy,luci-app-openclash,luci-app-daed,daed,luci-app-dae,dae,v2ray-geodata}
 
         if clone_repo "https://github.com/fw876/helloworld" "$tmp_dir/fw_helloworld"; then
             cp -rf "$tmp_dir/fw_helloworld/lua-neturl" "$tmp_dir/openwrt_helloworld/"
@@ -444,14 +444,14 @@ sync_lede_pkg() {
     tmp_dir="$(mktemp -d)"
 
     local subpaths=(
-        "package/network/services/fullconenat-nft"
+#        "package/network/services/fullconenat-nft"
         "package/kernel/r8168"
     )
 
     if sparse_clone "https://github.com/coolsnowwolf/lede" "$tmp_dir/upstream" "${subpaths[@]}"; then
-        mkdir -p "$tmp_dir/invasive_fullcone"
-        cp -rf "$tmp_dir/upstream/package/network/services/fullconenat-nft" "$tmp_dir/invasive_fullcone/"
-        deploy_dir "$tmp_dir/invasive_fullcone/fullconenat-nft" "$REPO_ROOT/invasive/fullconenat-nft"
+#        mkdir -p "$tmp_dir/invasive_fullcone"
+#        cp -rf "$tmp_dir/upstream/package/network/services/fullconenat-nft" "$tmp_dir/invasive_fullcone/"
+#        deploy_dir "$tmp_dir/invasive_fullcone/fullconenat-nft" "$REPO_ROOT/invasive/fullconenat-nft"
 
         mkdir -p "$tmp_dir/apps_lede/r8168"
         cp -rf "$tmp_dir/upstream/package/kernel/r8168" "$tmp_dir/apps_lede/"
@@ -483,7 +483,7 @@ sync_imm_pkg() {
         "libs/libcron"
         "libs/quickjspp"
         "libs/toml11"
-        "net/sing-box"
+#        "net/sing-box"
         "net/frp"
     )
 
@@ -496,10 +496,10 @@ sync_imm_pkg() {
             fi
         done
 
-        local sing_mk="$tmp_dir/$target/sing-box/Makefile"
-        if [ -f "$sing_mk" ]; then
-            sed -i 's|\.\./\.\./|$(TOPDIR)/feeds/packages/|' "$sing_mk" 2>/dev/null || true
-        fi
+#        local sing_mk="$tmp_dir/$target/sing-box/Makefile"
+#        if [ -f "$sing_mk" ]; then
+#            sed -i 's|\.\./\.\./|$(TOPDIR)/feeds/packages/|' "$sing_mk" 2>/dev/null || true
+#        fi
 
         local frp_mk="$tmp_dir/$target/frp/Makefile"
         if [ -f "$frp_mk" ]; then
