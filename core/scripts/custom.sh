@@ -277,24 +277,24 @@ sync_unblockmusic() {
 # ------------------------------------------------------------------------------
 # luci-app-taskplan
 # ------------------------------------------------------------------------------
-sync_taskplan() {
-    local target="apps/luci-app-taskplan"
-    log_info "正在同步: $target..."
-    local tmp_dir
-    tmp_dir="$(mktemp -d)"
-
-    if clone_repo "https://github.com/sirpdboy/luci-app-taskplan" "$tmp_dir/luci-app-taskplan"; then
-        local menu_file="$tmp_dir/luci-app-taskplan/luci-app-taskplan/root/usr/share/luci/menu.d/luci-app-taskplan.json"
-        if [ -f "$menu_file" ]; then
-            sed -i 's/admin\/control\/taskplan/admin\/system\/taskplan/g' "$menu_file" 2>/dev/null || true
-        fi
-        deploy_dir "$tmp_dir/luci-app-taskplan" "$REPO_ROOT/$target"
-        rm -rf "$tmp_dir"
-        return 0
-    fi
-    rm -rf "$tmp_dir"
-    return 1
-}
+#sync_taskplan() {
+#    local target="apps/luci-app-taskplan"
+#    log_info "正在同步: $target..."
+#    local tmp_dir
+#    tmp_dir="$(mktemp -d)"
+#
+#    if clone_repo "https://github.com/sirpdboy/luci-app-taskplan" "$tmp_dir/luci-app-taskplan"; then
+#        local menu_file="$tmp_dir/luci-app-taskplan/luci-app-taskplan/root/usr/share/luci/menu.d/luci-app-taskplan.json"
+#        if [ -f "$menu_file" ]; then
+#            sed -i 's/admin\/control\/taskplan/admin\/system\/taskplan/g' "$menu_file" 2>/dev/null || true
+#        fi
+#        deploy_dir "$tmp_dir/luci-app-taskplan" "$REPO_ROOT/$target"
+#        rm -rf "$tmp_dir"
+#        return 0
+#    fi
+#    rm -rf "$tmp_dir"
+#    return 1
+#}
 
 # ------------------------------------------------------------------------------
 # uugamebooster
@@ -369,6 +369,65 @@ sync_immortalwrt_luci() {
                 deploy_dir "$tmp_dir/upstream/$path" "$REPO_ROOT/apps/$app_name"
             fi
         done
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+    rm -rf "$tmp_dir"
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# Lienol/openwrt-package (luci-app-control-timewol)
+# ------------------------------------------------------------------------------
+sync_Lienol_pkg() {
+    log_info "正在同步: Lienol_pkg 模块 (control-timewol)..."
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+
+    local subpaths=(
+        "luci-app-control-timewol"
+    )
+
+    if sparse_clone "https://github.com/Lienol/openwrt-package" "$tmp_dir/upstream" "${subpaths[@]}"; then
+        mkdir -p "$tmp_dir/Lienol_pkg"
+        cp -rf "$tmp_dir/upstream/luci-app-control-timewol" "$tmp_dir/Lienol_pkg/"
+        deploy_dir "$tmp_dir/Lienol_pkg/luci-app-control-timewol" "$REPO_ROOT/apps/luci-app-control-timewol"
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+    rm -rf "$tmp_dir"
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# nas-packages
+# ------------------------------------------------------------------------------
+sync_nas_pkgs() {
+    local target="legacy/nas_pkgs"
+    log_info "正在同步: $target..."
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+
+    if clone_repo "https://github.com/linkease/nas-packages" "$tmp_dir/nas_pkgs"; then
+        deploy_dir "$tmp_dir/nas_pkgs" "$REPO_ROOT/$target"
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+    rm -rf "$tmp_dir"
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# nas-packages
+# ------------------------------------------------------------------------------
+sync_nas_luci() {
+    local target="legacy/nas_luci"
+    log_info "正在同步: $target..."
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+
+    if clone_repo "https://github.com/linkease/nas-packages-luci" "$tmp_dir/nas_luci"; then
+        deploy_dir "$tmp_dir/nas_luci" "$REPO_ROOT/$target"
         rm -rf "$tmp_dir"
         return 0
     fi
@@ -475,10 +534,12 @@ run_all_custom_sync() {
         sync_openwrt_bandix
         sync_argon_theme
         sync_unblockmusic
-        sync_taskplan
         sync_uugamebooster
         sync_ap_modem
         sync_immortalwrt_luci
+        sync_Lienol_pkg
+        sync_nas_pkgs
+        sync_nas_luci
         sync_lede_pkg
         sync_imm_pkg
     )
