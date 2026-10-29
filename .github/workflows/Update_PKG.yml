@@ -31,8 +31,8 @@ jobs:
 
       - name: Commit changes
         run: |
-          git config --global user.email "simonsqiu@foxmail.com"
-          git config --global user.name "SimonsQiu"
+          git config --global user.email "18706334023@163.com"
+          git config --global user.name "Hdragon112"
           if [ -n "$(git status --porcelain)" ]; then
             git add .
             git commit -m "Update $(date +'%Y/%m/%d %H:%M:%S %Z')"
