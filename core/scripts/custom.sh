@@ -16,24 +16,24 @@ fi
 # ------------------------------------------------------------------------------
 # OpenAppFilter
 # ------------------------------------------------------------------------------
-sync_openappfilter() {
-    local target="legacy/OpenAppFilter"
-    log_info "正在同步: $target (sbwml/OpenAppFilter:v6)..."
-    local tmp_dir
-    tmp_dir="$(mktemp -d)"
-
-    if clone_repo "https://github.com/sbwml/OpenAppFilter" "$tmp_dir/OpenAppFilter" "v6"; then
-        sed -i 's/\r$//' "$tmp_dir/OpenAppFilter/open-app-filter/src/appfilter_ubus.c" 2>/dev/null || true
-        if [ -f "$PATCH_DIR/OpenAppFilter-disable-auto-load-engine.patch" ]; then
-            (cd "$tmp_dir" && patch -l -p0 < "$PATCH_DIR/OpenAppFilter-disable-auto-load-engine.patch" 2>/dev/null) || log_warn "OpenAppFilter patch 跳过或已包含"
-        fi
-        deploy_dir "$tmp_dir/OpenAppFilter" "$REPO_ROOT/$target"
-        rm -rf "$tmp_dir"
-        return 0
-    fi
-    rm -rf "$tmp_dir"
-    return 1
-}
+#sync_openappfilter() {
+#    local target="legacy/OpenAppFilter"
+#    log_info "正在同步: $target (sbwml/OpenAppFilter:v6)..."
+#    local tmp_dir
+#    tmp_dir="$(mktemp -d)"
+#
+#    if clone_repo "https://github.com/sbwml/OpenAppFilter" "$tmp_dir/OpenAppFilter" "v6"; then
+#        sed -i 's/\r$//' "$tmp_dir/OpenAppFilter/open-app-filter/src/appfilter_ubus.c" 2>/dev/null || true
+#        if [ -f "$PATCH_DIR/OpenAppFilter-disable-auto-load-engine.patch" ]; then
+#            (cd "$tmp_dir" && patch -l -p0 < "$PATCH_DIR/OpenAppFilter-disable-auto-load-engine.patch" 2>/dev/null) || log_warn "OpenAppFilter patch 跳过或已包含"
+#        fi
+#        deploy_dir "$tmp_dir/OpenAppFilter" "$REPO_ROOT/$target"
+#        rm -rf "$tmp_dir"
+#        return 0
+#    fi
+#    rm -rf "$tmp_dir"
+#    return 1
+#}
 
 # ------------------------------------------------------------------------------
 # openwrt_helloworld
