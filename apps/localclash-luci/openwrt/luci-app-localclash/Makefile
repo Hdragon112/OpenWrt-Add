@@ -1,0 +1,18 @@
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=luci-app-localclash
+PKG_VERSION:=0.1.0
+PKG_RELEASE:=87
+PKGARCH:=all
+PKG_LICENSE:=MIT
+
+LUCI_TITLE:=LuCI support for localClash
+LUCI_DEPENDS:=+luci-base +luci-lib-nixio +rpcd +uclient-fetch +curl +ca-bundle +jsonfilter +firewall4 +nftables +ip-full +kmod-tun +kmod-nft-tproxy
+
+define Package/luci-app-localclash/conffiles
+/etc/config/localclash
+endef
+
+include $(TOPDIR)/feeds/luci/luci.mk
+
+# call BuildPackage - OpenWrt buildroot signature

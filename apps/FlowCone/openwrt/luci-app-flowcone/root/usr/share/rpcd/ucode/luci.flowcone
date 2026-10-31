@@ -1,0 +1,66 @@
+#!/usr/bin/ucode
+
+'use strict';
+
+import { readfile } from 'fs';
+import { connect } from 'ubus';
+
+// Persistent connection, created once per module load (see luci.upnp).
+const ubus = connect();
+
+// Ask procd instead of forking `pidof flowcone` on every status request.
+function get_flowcone_pid() {
+	if (!ubus)
+		return null;
+
+	const res = ubus.call('service', 'list', { name: 'flowcone', verbose: true });
+
+	if (type(res) != 'object' ||
+	    type(res.flowcone) != 'object' ||
+	    type(res.flowcone.instances) != 'object')
+		return null;
+
+	for (let instance in res.flowcone.instances) {
+		const info = res.flowcone.instances[instance];
+
+		if (type(info) == 'object' && info.running && info.pid)
+			return +info.pid;
+	}
+
+	return null;
+}
+
+function get_process_memory(pid) {
+	if (!pid) return null;
+	let status = readfile('/proc/' + pid + '/status');
+	if (!status) return null;
+	let m = match(status, /VmRSS:\s+([0-9]+)\s+kB/);
+	return m ? sprintf('%.1f MB', +m[1] / 1024) : null;
+}
+
+const methods = {
+	status: {
+		call: function(req) {
+			const pid = get_flowcone_pid();
+			return {
+				running: pid != null,
+				pid: pid,
+				memory: pid ? get_process_memory(pid) : null
+			};
+		}
+	},
+
+	action: {
+		args: { action: 'string' },
+		call: function(req) {
+			let act = req.args ? req.args.action : 'restart';
+			if (act != 'start' && act != 'stop' && act != 'restart' && act != 'reload') {
+				return { success: false, error: 'Invalid action' };
+			}
+			system('/etc/init.d/flowcone ' + act + ' >/dev/null 2>&1 &');
+			return { success: true };
+		}
+	}
+};
+
+return { 'luci.flowcone': methods };
