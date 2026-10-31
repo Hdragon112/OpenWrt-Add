@@ -62,7 +62,7 @@ jobs:
       - name: Push changes
         id: push
         run: |
-          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:master
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:OP25
         continue-on-error: true
 
       # GITHUB_TOKEN 产生的 push 事件不会触发其它工作流（防递归），
@@ -71,7 +71,7 @@ jobs:
         if: steps.commit.outputs.feed_changed == 'true' && steps.push.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run "Build APK Feed & ImageBuilder Bundle" --ref master
+        run: gh workflow run "Build APK Feed & ImageBuilder Bundle" --ref OP25
 
       - name: Cleanup Workflow Logs
         uses: Mattraks/delete-workflow-runs@main
