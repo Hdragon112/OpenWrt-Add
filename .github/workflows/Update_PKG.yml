@@ -30,48 +30,21 @@ jobs:
           bash core/scripts/update.sh
 
       - name: Commit changes
-        id: commit
         run: |
-          set -euo pipefail
           git config --global user.email "18706334023@163.com"
           git config --global user.name "Hdragon112"
-
-          before="$(git rev-parse HEAD)"
-          feed_changed=false
-
           if [ -n "$(git status --porcelain)" ]; then
             git add .
             git commit -m "Update $(date +'%Y/%m/%d %H:%M:%S %Z')"
-
-            # feed 只由 apps/ 与 themes/ 装配；legacy/、core/ 的改动不必重建
-            paths="$(git diff --name-only "$before" HEAD -- apps themes)"
-            if [ -n "$paths" ]; then
-              feed_changed=true
-              count="$(printf '%s\n' "$paths" | wc -l)"
-              echo "apps/themes touched: ${count} file(s)"
-              # 用 awk 而不是 head：pipefail 下 head 提前关管道会让本步骤中止
-              printf '%s\n' "$paths" | awk 'NR<=20'
-            fi
           else
             echo "No changes to commit."
           fi
-
-          echo "feed_changed=${feed_changed}" >> "$GITHUB_OUTPUT"
         continue-on-error: true
 
       - name: Push changes
-        id: push
         run: |
           git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:OP25
         continue-on-error: true
-
-      # GITHUB_TOKEN 产生的 push 事件不会触发其它工作流（防递归），
-      # 而 workflow_dispatch 是官方豁免的两种事件之一，所以显式派发一次。
-      #- name: Trigger feed build
-      #  if: steps.commit.outputs.feed_changed == 'true' && steps.push.outcome == 'success'
-      #  env:
-      #    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #  run: gh workflow run "Build APK Feed & ImageBuilder Bundle" --ref OP25
 
       - name: Cleanup Workflow Logs
         uses: Mattraks/delete-workflow-runs@main
