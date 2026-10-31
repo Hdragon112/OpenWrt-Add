@@ -523,7 +523,6 @@ sync_imm_pkg() {
 # ------------------------------------------------------------------------------
 run_all_custom_sync() {
     local -a handlers=(
-        sync_openappfilter
         sync_helloworld
         sync_openwrt_pkgs
         sync_openclash
