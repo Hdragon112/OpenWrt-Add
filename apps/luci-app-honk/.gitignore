@@ -6,3 +6,8 @@
 .DS_Store
 *~
 
+*.bin
+*.bin.stamp
+dist/
+target/
+honk-src/
