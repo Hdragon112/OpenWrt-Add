@@ -6,7 +6,7 @@
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$REPO_ROOT" || exit 1
 
-APK_VALID_REGEX="^[0-9]+(\.[0-9]+)*[a-z]?(_(alpha|beta|pre|rc|cvs|svn|git|hg|p)[0-9]*)*$"
+APK_VALID_REGEX="^[0-9]+(\.[0-9]+)*[a-z]?(_(alpha|beta|pre|rc|cvs|svn|git|hg|p)[0-9]*)*(~[0-9a-zA-Z.]+)*$"
 
 echo "[Version] 开始执行 OpenWrt/Alpine 版本号合规修复..."
 
@@ -21,11 +21,10 @@ find "$REPO_ROOT" -type f -name "Makefile" ! -path "*/.*/*" ! -path "*/core/*" |
              [ "$temp_val" != "$new_val" ] && new_val="$temp_val"
         fi
 
-        if [[ "$new_val" == *"~"* ]]; then
-             new_val=$(echo "$new_val" | sed 's/~.*//')
-        fi
-
         if [[ "$new_val" != *"\$"* ]]; then
+            # 预处理：修复 Arch/上游常见的 .r[0-9]+ 格式 (如 1.0.5.r20241208 -> 1.0.5.20241208)
+            new_val=$(echo "$new_val" | sed -E 's/\.r([0-9]+)/.\1/g')
+
             if ! echo "$new_val" | grep -qE "$APK_VALID_REGEX"; then
                 s1=$(echo "$new_val" | sed 's/^[^0-9]*//')
                 s2=$(echo "$s1" | sed 's/[^0-9.]/./g')
