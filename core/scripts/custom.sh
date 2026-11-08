@@ -408,7 +408,11 @@ sync_nas_pkgs() {
     local tmp_dir
     tmp_dir="$(mktemp -d)"
 
-    if clone_repo "https://github.com/linkease/nas-packages" "$tmp_dir/nas_pkgs"; then
+    if clone_repo "https://github.com/linkease/nas-packages" "$tmp_dir/upstream"; then
+        mkdir -p "$tmp_dir/nas_pkgs"
+        cp -rf "$tmp_dir/upstream/network/services"/* "$tmp_dir/nas_pkgs/"
+        cp -rf "$tmp_dir/upstream/multimedia"/* "$tmp_dir/nas_pkgs/"
+        cp -rf "$tmp_dir/upstream/README.md" "$tmp_dir/nas_pkgs/"
         deploy_dir "$tmp_dir/nas_pkgs" "$REPO_ROOT/$target"
         rm -rf "$tmp_dir"
         return 0
@@ -418,7 +422,7 @@ sync_nas_pkgs() {
 }
 
 # ------------------------------------------------------------------------------
-# nas-packages
+# nas-luciapk
 # ------------------------------------------------------------------------------
 sync_nas_luci() {
     local target="legacy/nas_luci"
@@ -427,6 +431,9 @@ sync_nas_luci() {
     tmp_dir="$(mktemp -d)"
 
     if clone_repo "https://github.com/linkease/nas-packages-luci" "$tmp_dir/nas_luci"; then
+        mkdir -p "$tmp_dir/nas_luci"
+        cp -rf "$tmp_dir/upstream/luci"/* "$tmp_dir/nas_luci/"
+        cp -rf "$tmp_dir/upstream/README.md" "$tmp_dir/nas_luci/"
         deploy_dir "$tmp_dir/nas_luci" "$REPO_ROOT/$target"
         rm -rf "$tmp_dir"
         return 0
