@@ -430,10 +430,10 @@ sync_nas_luci() {
     local tmp_dir
     tmp_dir="$(mktemp -d)"
 
-    if clone_repo "https://github.com/linkease/nas-packages-luci" "$tmp_dir/nas_luci"; then
+    if clone_repo "https://github.com/linkease/nas-packages-luci" "$tmp_dir/upstream1"; then
         mkdir -p "$tmp_dir/nas_luci"
-        cp -rf "$tmp_dir/upstream/luci"/* "$tmp_dir/nas_luci/"
-        cp -rf "$tmp_dir/upstream/README.md" "$tmp_dir/nas_luci/"
+        cp -rf "$tmp_dir/upstream1/luci"/* "$tmp_dir/nas_luci/"
+        cp -rf "$tmp_dir/upstream1/README.md" "$tmp_dir/nas_luci/"
         deploy_dir "$tmp_dir/nas_luci" "$REPO_ROOT/$target"
         rm -rf "$tmp_dir"
         return 0
