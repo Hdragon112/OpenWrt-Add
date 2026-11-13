@@ -19,6 +19,10 @@
                              dump the dashboard gets (server.js passes it,
                              after --wired, --multiwan and --fullvpn
                              rewrote it)
+     luci.vantage survey     { device }: no channels; the replay has no
+                             nl80211 (the model falls back to iwinfo
+                             info's noise). survey() is the plugin's
+                             reduction of an nl80211 dump, for the tests
      luci.vantage set_alias  { mac, name, icon } -> uci vantage in the
                              store's overlay, committed at once
    tests/plugin.test.js checks this file, the real plugin (when a host
@@ -53,7 +57,9 @@ const POLICY = {
 	thermal: {},
 	wired: {},
 	routes: {},
-	set_alias: { mac: 'string', name: 'string', icon: 'string' }
+	survey: { device: 'string' },
+	set_alias: { mac: 'string', name: 'string', icon: 'string' },
+	set_quiet: { mac: 'string', quiet: 'boolean' }
 };
 
 function normMac(v) {
@@ -247,6 +253,36 @@ function setAlias(uci, args) {
 	return { ok: true, op, mac };
 }
 
+/* set_quiet's uci work (#110): a quiet section per muted MAC, at most
+   MAX_QUIET, against the same minimal cursor as setAlias */
+const MAX_QUIET = 512;
+function setQuiet(uci, args) {
+	const mac = normMac(args.mac);
+	if (!mac || isMulticast(mac)) return { ok: false, error: 'invalid-mac' };
+	if (typeof args.quiet !== 'boolean') return { ok: false, error: 'invalid-value' };
+	const quiet = uci.sections().filter(s => s['.type'] === 'quiet');
+	const mine = quiet.filter(s => normMac(s.mac) === mac).map(s => s['.name']);
+	let op;
+	if (args.quiet) {
+		if (mine.length) return { ok: true, op: 'none', mac };
+		if (quiet.length >= MAX_QUIET) return { ok: false, error: 'too-many' };
+		const sid = uci.add('quiet');
+		if (!sid) return { ok: false, error: 'failed' };
+		uci.set(sid, 'mac', mac);
+		op = 'add';
+	}
+	else {
+		if (!mine.length) return { ok: true, op: 'none', mac };
+		mine.forEach(sid => uci.del(sid));
+		op = 'delete';
+	}
+	if (!uci.commit()) {
+		if (uci.revert) uci.revert();
+		return { ok: false, error: 'failed' };
+	}
+	return { ok: true, op, mac };
+}
+
 /* rpcd's argument check: every argument must be in the policy with the
    declared type (absent ones are fine) */
 function argsOk(method, args) {
@@ -258,6 +294,26 @@ function argsOk(method, args) {
 		if (t !== pol[k]) return false;
 	}
 	return true;
+}
+
+/* survey: [ { mhz, noise } ] of an nl80211 survey dump of dev (an
+   array of messages; null for none or a failure, false when cut short), as the
+   plugin's survey(): each channel with a noise value, at most MAX_SURVEY.
+   wireless(dev) stands for the plugin's phy80211 check: an interface
+   cfg80211 does not drive is not asked (#124) */
+const MAX_SURVEY = 256, MAX_MHZ = 100000;
+function survey(dev, dump, wireless) {
+	const out = [];
+	if (typeof dev !== 'string' || !/^[A-Za-z0-9_.-]{1,15}$/.test(dev) || dev === '.' || dev === '..' || !wireless(dev)) return out;
+	const res = Array.isArray(dump) ? dump : (dump && typeof dump === 'object') ? [ dump ] : [];
+	for (const m of res) {
+		const s = (m && typeof m === 'object' && !Array.isArray(m) && m.survey_info && typeof m.survey_info === 'object' && !Array.isArray(m.survey_info)) ? m.survey_info : null;
+		const mhz = s ? s.frequency : null, noise = s ? s.noise : null;
+		if (!Number.isInteger(mhz) || mhz <= 0 || mhz > MAX_MHZ || !Number.isInteger(noise) || noise === 0 || noise < -128 || noise > 127) continue;
+		out.push({ mhz, noise });
+		if (out.length >= MAX_SURVEY) break;
+	}
+	return out;
 }
 
 /* thermal: [ { zone, type, temp } ] from a fixtures.js Fixtures (or
@@ -374,13 +430,14 @@ function call(store, method, args) {
 		return { result: [ 0, wirelessReply(status, status == null || empty ? storeSections(store, 'wireless') : null) ] };
 	}
 	if (method === 'thermal') return { result: [ 0, { zones: thermal(store.fixtures) } ] };
+	if (method === 'survey') return { result: [ 0, { results: survey(args.device, null, () => false) } ] };
 	if (method === 'wired') return { result: [ 0, { hosts: wired(store.synthetic && store.synthetic.fdb ? store.synthetic.fdb() : null) } ] };
 	if (method === 'routes') {
 		const dump = typeof store.ifaceDump === 'function' ? store.ifaceDump() : ((store.data('network.interface', 'dump', {}) || {}).interface || null);
 		return { result: [ 0, { routes: routes(kernelLookup(dump)) } ] };
 	}
 	if (store.uciSeed) store.uciSeed(CONFIG, { main: { '.anonymous': false, '.type': 'vantage', '.name': 'main' } });
-	return { result: [ 0, setAlias(storeCursor(store), args) ] };
+	return { result: [ 0, (method === 'set_quiet' ? setQuiet : setAlias)(storeCursor(store), args) ] };
 }
 
-module.exports = { OBJECT, POLICY, MAX_ALIASES, NAME_MAX, ICONS, normMac, validateName, reduceWireless, wirelessFromConfig, wirelessReply, thermal, wired, routes, kernelLookup, setAlias, argsOk, call };
+module.exports = { OBJECT, POLICY, MAX_ALIASES, MAX_QUIET, MAX_SURVEY, NAME_MAX, ICONS, normMac, validateName, reduceWireless, wirelessFromConfig, wirelessReply, thermal, wired, routes, kernelLookup, survey, setAlias, setQuiet, argsOk, call };

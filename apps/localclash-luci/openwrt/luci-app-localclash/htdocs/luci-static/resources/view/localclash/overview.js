@@ -3,7 +3,7 @@
 'require rpc';
 'require ui';
 'require localclash.style as localclashStyle';
-'require fs';
+'require localclash.task-logs as taskLogs';
 'require localclash.dashboard as dashboardAccess';
 'require localclash.takeover-issue-report as takeoverIssueReport';
 
@@ -16,6 +16,9 @@ var callStatus = rpc.declare({
 var callTakeoverStatus = rpc.declare({
 	object: 'localclash',
 	method: 'takeover_status',
+	params: [ 'probe_dns' ],
+	nobatch: true,
+	reject: true,
 	expect: { '': {} }
 });
 
@@ -29,12 +32,6 @@ var callBootstrapDefault = rpc.declare({
 	object: 'localclash',
 	method: 'bootstrap_default',
 	params: [ 'uris', 'core', 'template' ],
-	expect: { '': {} }
-});
-
-var callBootstrapLogs = rpc.declare({
-	object: 'localclash',
-	method: 'bootstrap_logs',
 	expect: { '': {} }
 });
 
@@ -127,13 +124,13 @@ var callLuciUpdateCheck = rpc.declare({
 var callMcpHelp = rpc.declare({
 	object: 'localclash',
 	method: 'mcp_help',
+	reject: true,
 	expect: { '': {} }
 });
 
 var lastOverviewStatusData = null;
 var oneClickUpdatePreferencesData = null;
 var dashboardURL = null;
-var DASHBOARD_CONFIG_PATH = '/root/localclash/.runtime/mihomo/config.yaml';
 
 function statusText(value) {
 	if (value === null || value === undefined || value === '')
@@ -170,21 +167,6 @@ function setText(id, text) {
 
 	if (node)
 		node.textContent = statusText(text);
-}
-
-function deferAfterPaint(fn, delay) {
-	var run = function() {
-		window.setTimeout(fn, delay || 0);
-	};
-
-	if (window.requestAnimationFrame) {
-		window.requestAnimationFrame(function() {
-			window.requestAnimationFrame(run);
-		});
-	}
-	else {
-		window.setTimeout(run, delay || 0);
-	}
 }
 
 function section(title, body, extraClass) {
@@ -244,13 +226,6 @@ function showResult(title, result, options) {
 
 function showError(err) {
 	ui.addNotification(null, E('p', {}, [ err.message || String(err) ]), 'danger');
-}
-
-function formatLogLines(lines) {
-	if (!lines || !lines.length)
-		return _('等待任务输出…');
-
-	return lines.join('\n');
 }
 
 function formatText(text) {
@@ -394,22 +369,17 @@ function trackTask(title, startPromise, options) {
 	var startedAt = options.startedAt ? options.startedAt * 1000 : Date.now();
 	var modal = showTaskModal(title, options.cancellable !== false, options);
 	var taskId = options.task && options.task.task_id;
-	var timer;
+	var logs;
 
-	function updateLogs() {
-		return callBootstrapLogs().then(function(result) {
-			var elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
-			var lines = (result && result.logs) || [];
-			modal.statusLine.textContent = options.resume ? formatText(_('正在恢复任务进度，已等待 %s 秒。'), elapsed) : formatText(_('任务执行中，已等待 %s 秒。'), elapsed);
-			modal.logOutput.textContent = formatLogLines(lines);
-			modal.logOutput.scrollTop = modal.logOutput.scrollHeight;
-		}).catch(function(err) {
-			if (transientTaskRpcError(err)) {
-				modal.statusLine.textContent = _('暂时无法连接路由器或会话已过期；请等待连接恢复，或重新登录查看后台任务。');
-				return;
-			}
-			modal.statusLine.textContent = formatText(_('无法读取任务输出：%s'), err.message || String(err));
-		});
+	function showProgress() {
+		var elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+		modal.statusLine.textContent = options.resume ? formatText(_('正在恢复任务进度，已等待 %s 秒。'), elapsed) : formatText(_('任务执行中，已等待 %s 秒。'), elapsed);
+	}
+
+	function showLogError(err) {
+		modal.statusLine.textContent = transientTaskRpcError(err)
+			? _('暂时无法连接路由器或会话已过期；请等待连接恢复，或重新登录查看后台任务。')
+			: formatText(_('无法读取任务输出：%s'), err.message || String(err));
 	}
 
 	function waitForTaskCompletion() {
@@ -438,18 +408,14 @@ function trackTask(title, startPromise, options) {
 			taskId = result.task_id;
 		if (result && result.cancellable === false)
 			modal.cancelButton.style.display = 'none';
-		var completion = (result && (result.started || result.running)) ? waitForTaskCompletion() : Promise.resolve(result);
-
-		timer = window.setInterval(updateLogs, 1000);
-		return updateLogs().then(function() {
-			return completion;
-		});
+		logs = taskLogs.monitor(modal.logOutput, showProgress, showLogError);
+		if (result && (result.started || result.running)) {
+			logs.start();
+			return waitForTaskCompletion();
+		}
+		return result;
 	}).then(function(finalResult) {
-		window.clearInterval(timer);
-		return updateLogs().then(function() {
-			return finalResult;
-		});
-	}).then(function(finalResult) {
+		var finalLogs = logs.finish();
 		if (finalResult && finalResult.ok === false)
 			modal.statusLine.textContent = formatText(_('任务失败：%s'), finalResult.message || finalResult.code || _('未知错误'));
 		else {
@@ -458,38 +424,34 @@ function trackTask(title, startPromise, options) {
 		}
 		modal.cancelButton.disabled = true;
 		modal.resultOutput.textContent = JSON.stringify(finalResult, null, 2);
+		return finalLogs;
 	}).catch(function(err) {
-		window.clearInterval(timer);
-		if (!timer)
+		var finalLogs = logs && logs.finish();
+		if (!logs)
 			modal.logOutput.textContent = _('任务未启动。');
 
-		return (timer ? updateLogs() : Promise.resolve()).then(function() {
-			modal.statusLine.textContent = formatText(_('任务失败：%s'), err.message || String(err));
-			modal.resultOutput.textContent = JSON.stringify({ ok: false, message: err.message || String(err) }, null, 2);
-			modal.cancelButton.disabled = true;
-		});
+		modal.statusLine.textContent = formatText(_('任务失败：%s'), err.message || String(err));
+		modal.resultOutput.textContent = JSON.stringify({ ok: false, message: err.message || String(err) }, null, 2);
+		modal.cancelButton.disabled = true;
+		return finalLogs;
 	});
 }
 
 var taskResumeChecked = false;
 
-function resumeTaskIfNeeded() {
-	if (taskResumeChecked)
+function resumeTaskIfNeeded(task) {
+	if (taskResumeChecked || !task || !task.task || task.running !== true)
 		return Promise.resolve();
 	taskResumeChecked = true;
 
-	return callBootstrapTaskStatus().then(function(task) {
-		if (!task || !task.task)
-			return null;
-		if (task.running === true)
-			return trackTask(taskLabel(task), Promise.resolve({ started: true }), {
-				resume: true,
-				task: task,
-				startedAt: task.started_at || 0,
-				cancellable: task.cancellable !== false
-			});
-		return null;
-	}).catch(function() {
+	return trackTask(taskLabel(task), Promise.resolve({ started: true }), {
+		resume: true,
+		task: task,
+		startedAt: task.started_at || 0,
+		cancellable: task.cancellable !== false
+	}).then(function() {
+		return callBootstrapTaskStatus();
+	}).then(updateOneClickUpdateButton).catch(function() {
 		return null;
 	});
 }
@@ -609,12 +571,6 @@ function linkButton(label, href, extraClass) {
 			window.location.href = href;
 		}
 	}, [ label ]);
-}
-
-function loadDashboardURL() {
-	return fs.read(DASHBOARD_CONFIG_PATH).then(function(config) {
-		return dashboardAccess.buildURL(config, window.location);
-	});
 }
 
 function dashboardLink(extraClass) {
@@ -947,56 +903,35 @@ function bootRestoreSummary(bootRestore) {
 	return _('未启用');
 }
 
-function refreshTakeoverStatus() {
-	return callTakeoverStatus().then(function(takeover) {
-		var text = takeoverState(takeover);
-		var cell = document.getElementById('localclash-overview-takeover-status');
-		var hero = document.getElementById('localclash-overview-takeover-hero');
-
-		if (cell)
-			cell.textContent = text;
-		if (hero)
-			hero.textContent = text;
-		replaceContent('localclash-overview-takeover-actions', takeoverSummaryActions(takeover));
-		updateStatePanelTakeoverAppearance(text, false);
-	}).catch(function(err) {
-		var text = takeoverFailureText(err);
-		var cell = document.getElementById('localclash-overview-takeover-status');
-		var hero = document.getElementById('localclash-overview-takeover-hero');
-
-		if (cell)
-			cell.textContent = text;
-		if (hero)
-			hero.textContent = text;
-		replaceContent('localclash-overview-takeover-actions', takeoverSummaryActions(null));
-		updateStatePanelTakeoverAppearance(text, true);
+function refreshTakeoverStatus(data, task, state) {
+	return callTakeoverStatus(runtimeRunning(productStatus(data))).catch(function(err) {
+		return { ok: false, code: err.code, message: err.message || String(err) };
+	}).then(function(takeover) {
+		if (state.id === 'running')
+			replaceContent('localclash-overview-state', statePanel(state, takeover));
+		replaceContent('localclash-overview-summary-body', summaryTable(data, takeover, task, state));
 	});
 }
 
-function updateStatePanelTakeoverAppearance(text, failed) {
-	var panel = document.getElementById('localclash-state-panel');
-	var badge;
-	var tableLabel = document.getElementById('localclash-overview-takeover-status');
-	var tableBadge = tableLabel ? tableLabel.parentNode : null;
-	var tone;
+function takeoverTone(takeover) {
+	if (takeover && takeover.pending === true)
+		return 'info';
+	if (takeover && takeover.ok === false)
+		return 'danger';
+	return takeoverState(takeover) === _('已生效') ? 'success' : 'warning';
+}
 
-	if (!panel)
-		return;
+function runtimeWarning(takeover) {
+	var status = takeover && takeover.ok === true && takeover.status;
+	var dns = status && status.dns;
 
-	badge = panel.querySelector('.localclash-status-badge');
-	tone = failed ? 'danger' : (text === _('已生效') ? 'success' : 'warning');
-	[ 'success', 'warning', 'danger', 'info', 'neutral' ].forEach(function(name) {
-		panel.classList.remove('localclash-state-panel-' + name);
-		if (badge)
-			badge.classList.remove('localclash-status-' + name);
-		if (tableBadge)
-			tableBadge.classList.remove('localclash-status-' + name);
-	});
-	panel.classList.add('localclash-state-panel-' + tone);
-	if (badge)
-		badge.classList.add('localclash-status-' + tone);
-	if (tableBadge)
-		tableBadge.classList.add('localclash-status-' + tone);
+	if (!status || status.runtime_running !== true)
+		return '';
+	if (dns && dns.lease_active === true && dns.path === 'mihomo' && dns.probe && dns.probe.state === 'failed')
+		return _('DNS 仍由 Mihomo 接管，本次 DNS 查询失败。');
+	if (status.controller_ready === false)
+		return _('Mihomo 进程仍在运行，控制器未响应。');
+	return '';
 }
 
 function statusFailureMessage(data) {
@@ -1024,6 +959,10 @@ function refreshOverviewStatus() {
 		}),
 		callBootstrapTaskStatus().catch(function(err) {
 			return { ok: false, running: false, done: false, message: err.message || String(err) };
+		}).then(function(task) {
+			updateOneClickUpdateButton(task);
+			resumeTaskIfNeeded(task);
+			return task;
 		})
 	]).then(function(results) {
 		var data = results[0] || {};
@@ -1041,14 +980,15 @@ function refreshOverviewStatus() {
 			state = classify(data, takeover, task);
 		}
 
-		replaceContent('localclash-overview-state', statePanel(state));
+		replaceContent('localclash-overview-state', statePanel(state, takeover));
 		replaceContent('localclash-overview-actions', primaryActions(state));
 		updateBootstrapStartButton();
 		lastOverviewStatusData = data.ok === false ? null : data;
 		replaceContent('localclash-overview-summary-body', data.ok === false ? summaryErrorTable(statusFailureMessage(data)) : summaryTable(data, takeover, task, state));
-		return refreshTakeoverStatus().then(function() {
-			return refreshOneClickUpdateCheck(lastOverviewStatusData, task);
-		});
+		return Promise.all([
+			data.ok === false ? null : refreshTakeoverStatus(data, task, state),
+			refreshOneClickUpdateCheck(lastOverviewStatusData)
+		]);
 	});
 }
 
@@ -1117,11 +1057,11 @@ function classify(data, takeover, task) {
 	};
 }
 
-function stateTone(state) {
+function stateTone(state, takeover, warning) {
 	if (!state)
 		return 'neutral';
 	if (state.id === 'running')
-		return 'success';
+		return warning ? 'warning' : takeoverTone(takeover);
 	if (state.id === 'status_failed')
 		return 'danger';
 	if (state.id === 'task_running' || state.id === 'loading')
@@ -1161,38 +1101,41 @@ function statePanelActions(state) {
 
 	if (state.id === 'status_failed')
 		return [
-			commandButton(_('查看日志'), callBootstrapLogs, 'cbi-button-apply', { keepOpen: true }),
+			commandButton(_('查看日志'), taskLogs.read, 'cbi-button-apply', { keepOpen: true }),
 			linkButton(_('进入进阶'), L.url('admin/services/localclash/advanced'))
 		];
 
 	return [];
 }
 
-function statePanel(state) {
+function statePanel(state, takeover) {
 	var message;
+	var running = state && state.id === 'running';
+	var warning = running && runtimeWarning(takeover);
+	var tone = stateTone(state, takeover, warning);
+	var title = warning ? _('运行中 · 不稳定') : (state && state.title ? state.title : _('状态未知'));
 	var actions = statePanelActions(state);
+	var copy;
 	var children;
 
-	if (state && state.id === 'running') {
+	if (running) {
 		message = E('p', { 'class': 'localclash-state-message' }, [
 			_('Mihomo 运行时正在运行，网络接管：'),
-			E('span', { 'id': 'localclash-overview-takeover-hero' }, [ _('检查中…') ])
+			takeoverState(takeover)
 		]);
 	}
 	else {
 		message = E('p', { 'class': 'localclash-state-message' }, [ state && state.message ? state.message : '-' ]);
 	}
 
-	children = [
-		E('div', { 'class': 'localclash-state-copy' }, [
-			statusBadge(state && state.title ? state.title : _('状态未知'), stateTone(state)),
-			message
-		])
-	];
+	copy = [ statusBadge(title, tone), message ];
+	if (warning)
+		copy.push(E('p', { 'class': 'localclash-state-message', 'role': 'status' }, [ warning ]));
+	children = [ E('div', { 'class': 'localclash-state-copy' }, copy) ];
 	if (actions.length)
 		children.push(E('div', { 'class': 'localclash-state-actions' }, actions));
 
-	return E('div', { 'id': 'localclash-state-panel', 'class': 'localclash-state-panel localclash-state-panel-' + stateTone(state) }, children);
+	return E('div', { 'id': 'localclash-state-panel', 'class': 'localclash-state-panel localclash-state-panel-' + tone }, children);
 }
 
 function primaryActions(state) {
@@ -1200,7 +1143,7 @@ function primaryActions(state) {
 		return [
 			bootstrapSetupPanel(false),
 			actionRow([
-				commandButton(_('查看日志'), callBootstrapLogs, null, { keepOpen: true })
+				commandButton(_('查看日志'), taskLogs.read, null, { keepOpen: true })
 			])
 		];
 	}
@@ -1212,11 +1155,11 @@ function primaryActions(state) {
 	return [];
 }
 
-function mihomoSummary(data, status) {
+function mihomoSummary(data, status, warning) {
 	var core = data.core || {};
 
 	if (runtimeRunning(status))
-		return _('运行中');
+		return warning ? _('运行中 · 不稳定') : _('运行中');
 	if (!core.installed)
 		return _('缺失');
 	if (componentInstalled(status, [ 'mihomo' ]))
@@ -1382,33 +1325,26 @@ function oneClickUpdateSummary(luciCheck, coreCheck) {
 	return _('正在检查更新…');
 }
 
-function applyOneClickUpdateCheck(luciCheck, coreCheck, task) {
-	var status = document.getElementById('localclash-one-click-update-status');
+function updateOneClickUpdateButton(task) {
 	var button = document.getElementById('localclash-one-click-update-button');
-	var enabled = !(task && task.running === true);
 
-	if (status)
-		status.textContent = oneClickUpdateSummary(luciCheck, coreCheck);
-	if (button)
-		button.disabled = !enabled;
+	if (button && button.getAttribute('aria-busy') !== 'true')
+		button.disabled = !!(task && task.running === true);
 }
 
-function refreshOneClickUpdateCheck(data, task) {
+function refreshOneClickUpdateCheck(data) {
 	var versions = document.getElementById('localclash-current-versions');
 	var status = document.getElementById('localclash-one-click-update-status');
-	var button = document.getElementById('localclash-one-click-update-button');
 
 	if (!status)
 		return Promise.resolve();
 	if (versions)
 		versions.textContent = currentVersionsSummary(data);
 	if (!data) {
-		applyOneClickUpdateCheck({ ok: false, message: _('状态数据未加载') }, null);
+		status.textContent = oneClickUpdateSummary({ ok: false, message: _('状态数据未加载') }, null);
 		return Promise.resolve();
 	}
 
-	if (button)
-		button.disabled = true;
 	status.textContent = _('正在检查更新…');
 
 	return Promise.all([
@@ -1419,7 +1355,7 @@ function refreshOneClickUpdateCheck(data, task) {
 			return { ok: false, message: err.message || String(err) };
 		})
 	]).then(function(results) {
-		applyOneClickUpdateCheck(results[0] || {}, results[1] || {}, task);
+		status.textContent = oneClickUpdateSummary(results[0] || {}, results[1] || {});
 	});
 }
 
@@ -1456,7 +1392,18 @@ function summaryTable(data, takeover, task, state) {
 	var dashboardReady = componentInstalled(status, [ 'dashboard', 'ui' ]);
 	var subscriptionReady = subscriptionConfigured(status);
 	var takeoverText = takeoverState(takeover);
-	var takeoverTone = takeover && takeover.pending === true ? 'info' : (takeoverText === _('已生效') ? 'success' : 'warning');
+	var warning = mihomoRunning && runtimeWarning(takeover);
+	var mihomoStatus = statusBadge(mihomoSummary(data, status, warning), mihomoRunning && !warning ? 'success' : 'warning');
+	var mihomoActions = [ recentTaskButton() ];
+
+	if (mihomoRunning)
+		mihomoActions.unshift(runtimeIssueReportButton(takeover));
+	if (warning && state.id !== 'running') {
+		mihomoStatus = E('div', {}, [
+			mihomoStatus,
+			E('div', { 'class': 'localclash-muted' }, [ warning ])
+		]);
+	}
 
 	return E('table', { 'class': 'table cbi-section-table localclash-summary-table' }, [
 		E('tbody', {}, [
@@ -1465,11 +1412,11 @@ function summaryTable(data, takeover, task, state) {
 				E('th', { 'class': 'th', 'scope': 'col' }, [ _('目前状态') ]),
 				E('th', { 'class': 'th cbi-section-actions', 'scope': 'col' }, [ _('操作') ])
 			]),
-			summaryActionRow(_('Mihomo 核心'), statusBadge(mihomoSummary(data, status), mihomoRunning ? 'success' : 'warning'), [ recentTaskButton() ]),
+			summaryActionRow(_('Mihomo 核心'), mihomoStatus, mihomoActions),
 			E('tr', { 'class': 'tr cbi-rowstyle-1' }, [
 				E('td', { 'class': 'td', 'data-title': _('项目') }, [ _('网络接管') ]),
 				E('td', { 'class': 'td', 'data-title': _('目前状态') }, [
-					statusBadge(takeoverText, takeoverTone, { 'id': 'localclash-overview-takeover-status' })
+					statusBadge(takeoverText, takeoverTone(takeover), { 'id': 'localclash-overview-takeover-status' })
 				]),
 				E('td', { 'class': 'td cbi-section-actions', 'id': 'localclash-overview-takeover-actions' }, takeoverSummaryActions(takeover))
 			]),
@@ -1549,13 +1496,13 @@ function takeoverIssueLogs() {
 	});
 }
 
-function takeoverIssueButtonBusy(button, busy, label) {
+function issueReportButtonBusy(button, busy, label) {
 	button.disabled = busy;
 	button.textContent = busy ? _('正在收集诊断…') : label;
 	button.setAttribute('aria-busy', busy ? 'true' : 'false');
 }
 
-function downloadTakeoverReport(issue) {
+function downloadIssueReport(issue) {
 	var url = URL.createObjectURL(new Blob([ issue.full_report ], { type: 'text/plain;charset=utf-8' }));
 	var link = E('a', { href: url, download: issue.filename });
 	document.body.appendChild(link);
@@ -1564,16 +1511,16 @@ function downloadTakeoverReport(issue) {
 	window.setTimeout(function() { URL.revokeObjectURL(url); }, 0);
 }
 
-function showTakeoverReport(logs) {
-	var issue = takeoverIssueReport.buildGitHubIssue(logs);
+function showIssueReport(logs, issue, labels) {
+	var reportId = 'localclash-' + labels.kind + '-report';
 	var preview = E('textarea', {
-		'id': 'localclash-takeover-report-preview',
+		'id': reportId + '-preview',
 		'class': 'cbi-input-textarea localclash-copybox',
 		'readonly': 'readonly',
 		'rows': 16,
 		'aria-label': _('完整问题报告')
 	}, [ issue.full_report ]);
-	var status = E('p', { 'id': 'localclash-takeover-report-status' }, [
+	var status = E('p', { 'id': reportId + '-status', 'role': 'status' }, [
 		_('请检查报告内容。回报 GitHub 时上传完整文本文件作为附件，避免正文长度限制丢失日志。')
 	]);
 	function copyReport() {
@@ -1595,7 +1542,7 @@ function showTakeoverReport(logs) {
 			}
 			issueWindow.opener = null;
 			try {
-				downloadTakeoverReport(issue);
+				downloadIssueReport(issue);
 				status.textContent = _('请将刚下载的报告文件上传到 GitHub Issue 正文，确认附件上传完成后再提交。');
 				issueWindow.location.replace(issue.url);
 			}
@@ -1605,7 +1552,7 @@ function showTakeoverReport(logs) {
 			}
 		}
 	}, [ _('下载并打开 GitHub') ]);
-	ui.showModal(_('网络接管问题报告'), [
+	ui.showModal(labels.title, [
 		E('p', {}, [ logs.complete ? _('诊断已采集。') : _('部分证据未取得；报告已保留具体失败、原始输出和缺失原因。') ]),
 		status,
 		preview,
@@ -1613,10 +1560,10 @@ function showTakeoverReport(logs) {
 			E('button', {
 				type: 'button', 'class': 'btn cbi-button',
 				click: function() { return copyReport().catch(function() {}); }
-			}, [ _('复制完整报告') ]),
+			}, [ labels.copy ]),
 			E('button', {
 				type: 'button', 'class': 'btn cbi-button',
-				click: function() { downloadTakeoverReport(issue); }
+				click: function() { downloadIssueReport(issue); }
 			}, [ _('下载报告') ]),
 			githubButton,
 			E('button', {
@@ -1627,8 +1574,13 @@ function showTakeoverReport(logs) {
 	]);
 }
 
-function takeoverIssueReportButton() {
-	var label = _('生成问题报告');
+function showTakeoverReport(logs) {
+	showIssueReport(logs, takeoverIssueReport.buildGitHubIssue(logs), {
+		kind: 'takeover', title: _('网络接管问题报告'), copy: _('复制完整报告')
+	});
+}
+
+function issueReportButton(label, showReport) {
 	return E('button', {
 		type: 'button',
 		'class': 'btn cbi-button localclash-button',
@@ -1637,12 +1589,24 @@ function takeoverIssueReportButton() {
 			var button = ev.currentTarget;
 			if (button.disabled)
 				return null;
-			takeoverIssueButtonBusy(button, true, label);
-			return takeoverIssueLogs().then(showTakeoverReport).catch(showError).finally(function() {
-				takeoverIssueButtonBusy(button, false, label);
+			issueReportButtonBusy(button, true, label);
+			return takeoverIssueLogs().then(showReport).catch(showError).finally(function() {
+				issueReportButtonBusy(button, false, label);
 			});
 		}
 	}, [ label ]);
+}
+
+function takeoverIssueReportButton() {
+	return issueReportButton(_('生成问题报告'), showTakeoverReport);
+}
+
+function runtimeIssueReportButton(takeover) {
+	return issueReportButton(_('生成运行问题报告'), function(logs) {
+		showIssueReport(logs, takeoverIssueReport.buildRuntimeGitHubIssue(logs, takeover), {
+			kind: 'runtime', title: _('运行问题报告'), copy: _('复制日志和诊断')
+		});
+	});
 }
 
 function takeoverIssueReportBody() {
@@ -1655,10 +1619,7 @@ function takeoverIssueReportBody() {
 }
 
 function mcpGuidanceBody(help) {
-	if (help && help.loading === true)
-		return E('p', { 'class': 'localclash-muted' }, [ _('正在加载 MCP 接入指令…') ]);
-
-	var text = (help && help.text) || '';
+	var text = help.text;
 	var rows = Math.max(10, text.split(/\r?\n/).length + 2);
 
 	return E('div', {}, [
@@ -1681,16 +1642,34 @@ function mcpGuidanceBody(help) {
 	]);
 }
 
-function supportAndDiagnostics(help) {
+function supportAndDiagnostics() {
+	var helpRequest;
+	var bodyId = 'localclash-overview-mcp-body';
+
 	return section(_('帮助与诊断'), E('div', { 'class': 'localclash-support-list' }, [
-		E('details', { 'class': 'localclash-support-item' }, [
+		E('details', {
+			'class': 'localclash-support-item',
+			'toggle': function(ev) {
+				if (!ev.currentTarget.open || helpRequest)
+					return;
+
+				replaceContent(bodyId, E('p', { 'class': 'localclash-muted' }, [ _('正在加载 MCP 接入指令…') ]));
+				helpRequest = callMcpHelp().then(function(help) {
+					if (!help || help.ok !== true || typeof help.text !== 'string')
+						throw new Error(help && (help.message || help.code) || _('未知错误'));
+					replaceContent(bodyId, mcpGuidanceBody(help));
+				}).catch(function(err) {
+					replaceContent(bodyId, E('p', {}, [ formatText(_('读取 MCP 接入指令失败：%s'), err.message || String(err)) ]));
+					helpRequest = null;
+				});
+				return helpRequest;
+			}
+		}, [
 			E('summary', {}, [
 				E('span', {}, [ _('Agent Skill 与 MCP 接入') ]),
 				E('small', {}, [ _('复制接入指令') ])
 			]),
-			E('div', { 'id': 'localclash-overview-mcp-body', 'class': 'localclash-support-body' }, [
-				mcpGuidanceBody(help)
-			])
+			E('div', { 'id': bodyId, 'class': 'localclash-support-body' })
 		]),
 		E('details', { 'class': 'localclash-support-item' }, [
 			E('summary', {}, [
@@ -1702,19 +1681,11 @@ function supportAndDiagnostics(help) {
 	]), 'localclash-support');
 }
 
-function refreshMcpGuidance() {
-	return callMcpHelp().catch(function(err) {
-		return { ok: false, text: '', message: err.message || String(err) };
-	}).then(function(help) {
-		replaceContent('localclash-overview-mcp-body', mcpGuidanceBody(help));
-	});
-}
-
 return view.extend({
 	load: function() {
 		return Promise.all([
 			callOneClickUpdatePreferences().catch(function() { return null; }),
-			loadDashboardURL().catch(function() { return null; })
+			dashboardAccess.loadURL(window.location).catch(function() { return null; })
 		]);
 	},
 
@@ -1727,11 +1698,7 @@ return view.extend({
 
 		oneClickUpdatePreferencesData = results[0] || null;
 		dashboardURL = results[1];
-		deferAfterPaint(function() {
-			refreshOverviewStatus();
-			resumeTaskIfNeeded();
-		}, 600);
-		deferAfterPaint(refreshMcpGuidance, 1200);
+		window.setTimeout(refreshOverviewStatus, 0);
 
 		return E('main', {
 			'class': 'cbi-map localclash-view localclash-overview',
@@ -1751,7 +1718,7 @@ return view.extend({
 				summaryLoadingTable()
 			]), 'localclash-summary'),
 			oneClickUpdateSection(),
-			supportAndDiagnostics({ loading: true })
+			supportAndDiagnostics()
 		]);
 	}
 });

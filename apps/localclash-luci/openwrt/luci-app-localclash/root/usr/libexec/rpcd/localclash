@@ -6,6 +6,7 @@ DNS_GUARD="${LOCALCLASH_DNS_GUARD:-/usr/libexec/localclash/dns-guard}"
 STATE_DIR="${LOCALCLASH_STATE_DIR:-/root/localclash}"
 SERVICE="/etc/init.d/localclash-mcp"
 SUBSCRIPTION_SCHEDULER_SERVICE="${LOCALCLASH_SUBSCRIPTION_SCHEDULER_SERVICE:-/etc/init.d/localclash-subscription-scheduler}"
+POOL_SCHEDULER_SERVICE="${LOCALCLASH_POOL_SCHEDULER_SERVICE:-/etc/init.d/localclash-pool-scheduler}"
 RPCD_SERVICE="${LOCALCLASH_RPCD_SERVICE:-/etc/init.d/rpcd}"
 LUCI_RPCD_RELOAD_REQUIRED="${LOCALCLASH_LUCI_RPCD_RELOAD_REQUIRED:-/tmp/localclash-update/rpcd-reload-required}"
 LUCI_SUBSCRIPTION_SCHEDULER_RESTART_REQUIRED="${LOCALCLASH_SUBSCRIPTION_SCHEDULER_RESTART_REQUIRED:-/tmp/localclash-update/subscription-scheduler-restart-required}"
@@ -443,6 +444,17 @@ luci_update_sha_url() {
 	jsonfilter -i "$release" -e '@.assets[*].browser_download_url' 2>/dev/null | grep -E "$asset_regex" | head -n 1
 }
 
+luci_update_asset_digest() {
+	local release asset_url asset
+	release="$1"
+	asset_url="$2"
+	jsonfilter -i "$release" -e '@.assets[*]' 2>/dev/null | while IFS= read -r asset; do
+		[ "$(jsonfilter -s "$asset" -e '@.browser_download_url' 2>/dev/null)" = "$asset_url" ] || continue
+		jsonfilter -s "$asset" -e '@.digest' 2>/dev/null || true
+		break
+	done
+}
+
 luci_version_relation() {
 	local manager current target relation
 	manager="$1"
@@ -782,6 +794,9 @@ luci_update_retry() {
 	shift
 	attempt=1
 	while [ "$attempt" -le "$LUCI_UPDATE_MAX_ATTEMPTS" ]; do
+		if bounded_stage_expired; then
+			return 124
+		fi
 		if "$@"; then
 			if [ "$attempt" -gt 1 ]; then
 				log_line "LuCI 更新：${label}在第 ${attempt}/${LUCI_UPDATE_MAX_ATTEMPTS} 次尝试成功"
@@ -802,7 +817,7 @@ luci_update_retry() {
 }
 
 luci_update() {
-	local manager tmpdir release asset_url asset_version current_version version_relation sha_url package sha_file expected actual install_log tag rc install_excerpt
+	local manager tmpdir release asset_url asset_version current_version version_relation digest sha_url sha_source first_asset_url package sha_file expected actual install_log tag rc install_excerpt
 	log_line "LuCI 更新：开始"
 	if ! command -v jsonfilter >/dev/null 2>&1; then
 		fail "jsonfilter_missing" "需要 jsonfilter 解析 localclash-luci Release 信息。"
@@ -831,8 +846,7 @@ luci_update() {
 	fi
 	tag="$(jsonfilter -i "$release" -e '@.tag_name' 2>/dev/null)"
 	asset_url="$(luci_update_asset_url "$release" "$manager")"
-	sha_url="$(luci_update_sha_url "$release" "$manager")"
-	if [ -z "$asset_url" ] || [ -z "$sha_url" ]; then
+	if [ -z "$asset_url" ]; then
 		rm -rf "$tmpdir"
 		fail "luci_release_asset_missing" "最新 Release 中没有匹配当前包管理器的 LuCI 安装包。"
 		return 1
@@ -863,20 +877,46 @@ luci_update() {
 			return 0
 		fi
 	fi
-	log_line "LuCI 更新：正在下载 ${tag:-latest} 校验文件"
-	if ! luci_update_retry "下载校验文件" fetch_url_direct_first "$sha_url" "$sha_file"; then
-		rm -rf "$tmpdir"
-		fail "luci_package_download_failed" "无法下载 LuCI 安装包校验文件。"
-		return 1
-	fi
-	expected="$(sha256_expected_from_file "$sha_file")"
+	first_asset_url="$asset_url"
+	digest="$(luci_update_asset_digest "$release" "$asset_url")"
+	case "$digest" in
+		""|null)
+			sha_url="$(luci_update_sha_url "$release" "$manager")"
+			if [ -z "$sha_url" ]; then
+				rm -rf "$tmpdir"
+				fail "luci_release_asset_missing" "最新 Release 缺少 LuCI 安装包的 SHA-256 校验信息。"
+				return 1
+			fi
+			log_line "LuCI 更新：正在下载 ${tag:-latest} 校验文件"
+			if ! sha_source="$(luci_update_retry "下载校验文件" fetch_url_direct_first "$sha_url" "$sha_file")"; then
+				rm -rf "$tmpdir"
+				fail "luci_package_download_failed" "无法下载 LuCI 安装包校验文件。"
+				return 1
+			fi
+			expected="$(sha256_expected_from_file "$sha_file")"
+			if [ "$sha_url" = "$asset_url.sha256" ] && [ -n "$sha_source" ]; then
+				first_asset_url="${sha_source%.sha256}"
+			fi
+			;;
+		sha256:*)
+			expected="${digest#sha256:}"
+			case "$expected" in *[!0-9a-fA-F]*) expected="" ;; esac
+			if [ "${#expected}" -eq 64 ]; then
+				expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
+				log_line "LuCI 更新：使用 Release 安装包的 SHA-256"
+			else
+				expected=""
+			fi
+			;;
+		*) expected="" ;;
+	esac
 	if [ -z "$expected" ]; then
 		rm -rf "$tmpdir"
-		fail "luci_package_checksum_failed" "LuCI 安装包校验文件为空或格式错误。"
+		fail "luci_package_checksum_failed" "LuCI 安装包 SHA-256 校验信息为空或格式错误。"
 		return 1
 	fi
 	log_line "LuCI 更新：正在下载 ${tag:-latest} 安装包"
-	if ! luci_update_retry "下载并校验安装包" fetch_url_verified_direct_first "$asset_url" "$package" "$expected"; then
+	if ! luci_update_retry "下载并校验安装包" fetch_url_verified_direct_first "$asset_url" "$package" "$expected" "$first_asset_url"; then
 		rm -rf "$tmpdir"
 		fail_with_details "luci_package_checksum_failed" "LuCI 安装包下载失败或 sha256 校验失败，可能是 GitHub 镜像尚未同步最新 Release。" '"expected_sha":"'"$(json_escape "$expected")"'","target_version":"'"$(json_escape "$asset_version")"'"'
 		return 1
@@ -893,6 +933,10 @@ luci_update() {
 		rm -rf "$tmpdir"
 		fail_with_details "luci_package_metadata_invalid" "LuCI 安装包的套件名称或架构不兼容，已在调用包管理器前拒绝。" '"install_output":"'"$install_excerpt"'","package_manager":"'"$(json_escape "$manager")"'","target_version":"'"$(json_escape "$asset_version")"'"'
 		return 1
+	fi
+	if bounded_stage_expired; then
+		rm -rf "$tmpdir"
+		return 124
 	fi
 	log_line "LuCI 更新：sha256 校验通过，正在安装"
 	luci_update_install_package "$manager" "$package" "$install_log"
@@ -940,7 +984,7 @@ write_task_running() {
 	summary="$1"
 	task="${2:-task}"
 	extra=""
-	if [ "$task" = runtime_restart ] || [ "$task" = subscription_schedule ]; then
+	if [ "$task" = runtime_restart ] || [ "$task" = subscription_schedule ] || [ "$task" = pool_capability ]; then
 		extra=',"cancellable":false,"task_id":"'"$(json_escape "$3")"'"'
 	fi
 	printf '{"ok":true,"running":true,"done":false,"started_at":%s,"task":"%s","summary":"%s"%s}\n' "$(now_epoch)" "$(json_escape "$task")" "$(json_escape "$summary")" "$extra" > "${TASK_STATUS}.tmp.$$" && mv "${TASK_STATUS}.tmp.$$" "$TASK_STATUS"
@@ -1194,6 +1238,8 @@ task_cancel() {
 				fail "task_not_cancellable" "订阅已进入运行时重启和网络接管验证阶段，不能中途取消；关闭页面不会停止任务。"
 			elif [ "$task" = subscription_schedule ]; then
 				fail "task_not_cancellable" "订阅更新和热加载任务不能中途取消；关闭页面不会停止任务。"
+			elif [ "$task" = pool_capability ]; then
+				fail "task_not_cancellable" "线路池设置正在应用。关闭页面后任务会继续执行。"
 			else
 				fail "task_not_cancellable" "重启正在恢复运行时和网络接管，不能中途取消；关闭页面不会停止任务。"
 			fi
@@ -1249,36 +1295,85 @@ run_with_heartbeat_until_complete() {
 	run_with_heartbeat_timeout 0 "$@"
 }
 
+bounded_stage_expired() {
+	[ -n "${bounded_stage_deadline:-}" ] && [ "$(now_epoch)" -ge "$bounded_stage_deadline" ]
+}
+
+stage_heartbeat() {
+	local stage_pid label started sleeper elapsed
+	stage_pid="$1"
+	label="$2"
+	started="$3"
+	sleeper=""
+	trap '
+		if [ -n "$sleeper" ]; then
+			kill "$sleeper" 2>/dev/null || true
+			wait "$sleeper" 2>/dev/null || true
+		fi
+		exit 0
+	' TERM
+	while kill -0 "$stage_pid" 2>/dev/null; do
+		sleep "$TASK_HEARTBEAT_INTERVAL" &
+		sleeper="$!"
+		wait "$sleeper" || return 0
+		sleeper=""
+		if kill -0 "$stage_pid" 2>/dev/null; then
+			elapsed=$(($(now_epoch) - started))
+			log_line "${label}：仍在执行（${elapsed}s）"
+		fi
+	done
+}
+
 run_with_heartbeat_timeout() {
-	local timeout label output tmp_output pid elapsed rc
+	local timeout label output tmp_output pid started elapsed delay remaining rc timed_out bounded_stage_deadline heartbeat_pid
 	timeout="$1"
 	label="$2"
 	output="$3"
 	shift 3
-	elapsed=0
+	started="$(now_epoch)"
+	timed_out=false
+	bounded_stage_deadline=""
+	heartbeat_pid=""
+	if [ "$timeout" -gt 0 ]; then
+		bounded_stage_deadline=$((started + timeout))
+	fi
 	tmp_output="${output}.run.$$"
 	rm -f "$tmp_output"
 	( "$@" > "$tmp_output" ) &
 	pid="$!"
-	while kill -0 "$pid" 2>/dev/null; do
-		sleep "$TASK_HEARTBEAT_INTERVAL"
-		if kill -0 "$pid" 2>/dev/null; then
-			elapsed=$((elapsed + TASK_HEARTBEAT_INTERVAL))
+	if [ -z "$bounded_stage_deadline" ]; then
+		stage_heartbeat "$pid" "$label" "$started" </dev/null >/dev/null 2>&1 &
+		heartbeat_pid="$!"
+	else
+		while kill -0 "$pid" 2>/dev/null; do
+			delay="$TASK_HEARTBEAT_INTERVAL"
+			remaining=$((bounded_stage_deadline - $(now_epoch)))
+			[ "$remaining" -ge "$delay" ] || delay="$remaining"
+			[ "$delay" -le 0 ] || sleep "$delay"
+			kill -0 "$pid" 2>/dev/null || break
+			elapsed=$(($(now_epoch) - started))
 			log_line "${label}：仍在执行（${elapsed}s）"
-			if [ "$timeout" -gt 0 ] && [ "$elapsed" -ge "$timeout" ]; then
+			if bounded_stage_expired; then
 				log_line "${label}：超过 ${timeout}s，已停止等待"
+				timed_out=true
 				kill_process_tree -TERM "$pid"
 				sleep 2
 				kill_process_tree -KILL "$pid"
-				wait "$pid" 2>/dev/null || true
-				rm -f "$tmp_output"
-				printf '{"ok":false,"code":"step_timeout","message":"%s 超时，请检查路由器是否能访问下载源，或稍后重试。","details":{"timeout_seconds":%s},"next_actions":["确认路由器可以访问下载源后重试。"]}\n' "$(json_escape "$label")" "$timeout" > "$output"
-				return 124
+				break
 			fi
-		fi
-	done
-	wait "$pid"
-	rc="$?"
+		done
+	fi
+	rc=0
+	wait "$pid" || rc="$?"
+	if [ -n "$heartbeat_pid" ]; then
+		kill "$heartbeat_pid" 2>/dev/null || true
+		wait "$heartbeat_pid" 2>/dev/null || true
+	fi
+	if [ "$timed_out" = true ] || { [ "$rc" -ne 0 ] && bounded_stage_expired; }; then
+		rm -f "$tmp_output"
+		printf '{"ok":false,"code":"step_timeout","message":"%s 超时，请检查路由器是否能访问下载源，或稍后重试。","details":{"timeout_seconds":%s},"next_actions":["确认路由器可以访问下载源后重试。"]}\n' "$(json_escape "$label")" "$timeout" > "$output"
+		return 124
+	fi
 	if [ -f "$tmp_output" ]; then
 		mv "$tmp_output" "$output"
 	else
@@ -1288,32 +1383,42 @@ run_with_heartbeat_timeout() {
 }
 
 fetch_single_url() {
-	local url output downloader stderr_file started completed elapsed rc bytes host line failure_reason
+	local url output downloader stderr_file started completed elapsed rc bytes host line failure_reason timeout remaining
 	url="$1"
 	output="$2"
 	host="$(download_url_host "$url")"
 	stderr_file="${output}.fetch-stderr.$$"
 	started="$(now_epoch)"
+	timeout="$FETCH_TIMEOUT"
+	if [ -n "${bounded_stage_deadline:-}" ]; then
+		remaining=$((bounded_stage_deadline - started))
+		if [ "$remaining" -le 0 ]; then
+			log_line "下载：当前步骤已超时，未开始请求 host=$host"
+			return 124
+		fi
+		[ "$remaining" -ge "$timeout" ] || timeout="$remaining"
+	fi
 	rm -f "$stderr_file" "$output"
-	if command -v uclient-fetch >/dev/null 2>&1; then
+	if [ -n "${https_proxy:-}${HTTPS_PROXY:-}${http_proxy:-}${all_proxy:-}${ALL_PROXY:-}" ] && command -v curl >/dev/null 2>&1; then
+		# curl supports HTTPS downloads through the configured HTTP proxy.
+		downloader="curl"
+	elif command -v uclient-fetch >/dev/null 2>&1; then
 		downloader="uclient-fetch"
-		log_line "下载：开始 downloader=$downloader host=$host timeout=${FETCH_TIMEOUT}s"
-		fetch_with_watchdog "$url" uclient-fetch -T "$FETCH_TIMEOUT" -q -O "$output" "$url" 2>"$stderr_file"
-		rc=$?
 	elif command -v wget >/dev/null 2>&1; then
 		downloader="wget"
-		log_line "下载：开始 downloader=$downloader host=$host timeout=${FETCH_TIMEOUT}s"
-		fetch_with_watchdog "$url" wget -T "$FETCH_TIMEOUT" -q -O "$output" "$url" 2>"$stderr_file"
-		rc=$?
 	elif command -v curl >/dev/null 2>&1; then
 		downloader="curl"
-		log_line "下载：开始 downloader=$downloader host=$host timeout=${FETCH_TIMEOUT}s"
-		fetch_with_watchdog "$url" curl --max-time "$FETCH_TIMEOUT" -fsSL "$url" -o "$output" 2>"$stderr_file"
-		rc=$?
 	else
 		log_line "下载：失败 reason=downloader_missing host=$host"
 		return 1
 	fi
+	case "$downloader" in
+		curl) set -- curl --disable --max-time "$timeout" -fsSL "$url" -o "$output" ;;
+		*) set -- "$downloader" -T "$timeout" -q -O "$output" "$url" ;;
+	esac
+	log_line "下载：开始 downloader=$downloader host=$host timeout=${timeout}s"
+	fetch_with_watchdog "$url" "$timeout" "$@" 2>"$stderr_file"
+	rc=$?
 	if [ -s "$stderr_file" ]; then
 		while IFS= read -r line; do
 			log_line "下载器[$downloader]：$line"
@@ -1398,9 +1503,10 @@ log_download_dns_context() {
 }
 
 fetch_with_watchdog() {
-	local label pid watchdog elapsed rc watchdog_dir timeout_marker
+	local label timeout pid watchdog elapsed delay remaining rc watchdog_dir timeout_marker
 	label="$1"
-	shift
+	timeout="$2"
+	shift 2
 	watchdog_dir="$(mktemp -d /tmp/localclash-fetch-watchdog.XXXXXX)" || {
 		log_line "下载：失败 reason=watchdog_state_unavailable"
 		return 1
@@ -1411,13 +1517,16 @@ fetch_with_watchdog() {
 	(
 		elapsed=0
 		while kill -0 "$pid" 2>/dev/null; do
-			sleep 5
+			remaining=$((timeout - elapsed))
+			delay=5
+			[ "$remaining" -ge "$delay" ] || delay="$remaining"
+			sleep "$delay"
 			if kill -0 "$pid" 2>/dev/null; then
-				elapsed=$((elapsed + 5))
+				elapsed=$((elapsed + delay))
 				log_line "下载：等待 ${label}（${elapsed}s）"
-				if [ "$elapsed" -ge "$FETCH_TIMEOUT" ]; then
+				if [ "$elapsed" -ge "$timeout" ]; then
 					: > "$timeout_marker"
-					log_line "下载：超时 ${label} timeout=${FETCH_TIMEOUT}s"
+					log_line "下载：超时 ${label} timeout=${timeout}s"
 					kill "$pid" 2>/dev/null || exit 0
 					sleep 2
 					kill -9 "$pid" 2>/dev/null || true
@@ -1645,6 +1754,10 @@ commit_download_output() {
 	local tmp output
 	tmp="$1"
 	output="$2"
+	if bounded_stage_expired; then
+		rm -f "$tmp"
+		return 124
+	fi
 	if mv "$tmp" "$output"; then
 		return 0
 	fi
@@ -1685,6 +1798,7 @@ fetch_url_direct_first() {
 	log_line "下载：尝试 $url"
 	if fetch_single_url "$url" "$tmp"; then
 		commit_download_output "$tmp" "$output" || return 1
+		printf '%s\n' "$url"
 		return 0
 	fi
 	rm -f "$tmp"
@@ -1698,6 +1812,7 @@ fetch_url_direct_first() {
 		if fetch_single_url "$candidate" "$tmp"; then
 			commit_download_output "$tmp" "$output" || return 1
 			note_github_candidate_success "$url" "$candidate"
+			printf '%s\n' "$candidate"
 			return 0
 		fi
 		note_github_candidate_failure "$url" "$candidate"
@@ -1731,25 +1846,32 @@ fetch_manifest() {
 }
 
 fetch_url_verified_direct_first() {
-	local url output expected_sha tmp candidate actual_sha switched
+	local url output expected_sha first_url tmp candidate actual_sha switched
 	url="$1"
 	output="$2"
 	expected_sha="$3"
+	first_url="${4:-$url}"
 	switched=false
 	tmp="$output.download.$$"
 	rm -f "$tmp"
-	log_line "下载：尝试 $url"
-	if fetch_single_url "$url" "$tmp"; then
+	if [ "$first_url" != "$url" ]; then
+		log_line "下载：沿用校验文件的来源 $first_url"
+		switched=true
+	fi
+	log_line "下载：尝试 $first_url"
+	if fetch_single_url "$first_url" "$tmp"; then
 		actual_sha="$(sha256sum "$tmp" | cut -d ' ' -f 1)"
 		if [ "$actual_sha" = "$expected_sha" ]; then
 			commit_download_output "$tmp" "$output" || return 1
+			note_github_candidate_success "$url" "$first_url"
 			return 0
 		fi
-		log_line "下载：$url 校验和不匹配"
+		log_line "下载：$first_url 校验和不匹配"
 	fi
+	note_github_candidate_failure "$url" "$first_url"
 	rm -f "$tmp"
 	for candidate in $(github_download_candidates "$url"); do
-		[ "$candidate" = "$url" ] && continue
+		[ "$candidate" = "$first_url" ] && continue
 		if [ "$switched" = false ]; then
 			log_line "下载：正在切换 GitHub 镜像"
 			switched=true
@@ -1862,6 +1984,14 @@ call_takeover() {
 	fi
 	workdir="$(resolve_state_dir)" || return 1
 	(cd / && LOCALCLASH_CORE="$CORE" LOCALCLASH_WORKDIR="$workdir" "$TAKEOVER_MANAGER" "$@") 2>>"$LOG"
+}
+
+takeover_status() {
+	if [ ! -t 0 ] && [ "$(jsonfilter -e '@.probe_dns' 2>/dev/null)" = true ]; then
+		call_takeover status --json --probe-dns
+	else
+		call_takeover status --json
+	fi
 }
 
 runtime_stop() {
@@ -2518,18 +2648,14 @@ call_core_product_status() {
 	(cd / && LOCALCLASH_WORKDIR="$workdir" "$CORE" status --json)
 }
 
-status_required_bool() {
-	local path expression value
-	path="$1"
-	expression="$2"
-	value="$(jsonfilter -i "$path" -e "$expression" 2>/dev/null || true)"
-	case "$value" in
-		true|false)
-			printf '%s\n' "$value"
-			return 0
-			;;
-	esac
-	return 1
+status_booleans_valid() {
+	local value
+	for value; do
+		case "$value" in
+			true|false) ;;
+			*) return 1 ;;
+		esac
+	done
 }
 
 status_error_excerpt() {
@@ -2537,6 +2663,31 @@ status_error_excerpt() {
 	path="$1"
 	[ -s "$path" ] || return 0
 	sed -n '1,8p' "$path" 2>/dev/null | redact_diagnostic_stream | tr '\n\r\t' '   ' | cut -c1-480
+}
+
+dashboard_config() {
+	local config snippet
+	config="$STATE_DIR/.runtime/mihomo/config.yaml"
+	# Keep the YAML values intact for the Dashboard link parser in LuCI.
+	if ! snippet="$(LC_ALL=C awk '
+		/^(external-controller|external-ui|secret):/ {
+			key = substr($0, 1, index($0, ":") - 1)
+			if (seen[key]++)
+				next
+			gsub(/\\/, "\\\\&")
+			gsub(/"/, "\\\\&")
+			gsub(/\t/, "\\t")
+			gsub(/\r/, "\\r")
+			printf "%s%s", sep, $0
+			sep = "\\n"
+			if (++count == 3)
+				exit
+		}
+	' "$config" 2>/dev/null)"; then
+		fail "dashboard_config_unavailable" "无法读取 Mihomo 的 Dashboard 配置。"
+		return 1
+	fi
+	ok '"config":"'"$snippet"'"'
 }
 
 mcp_help() {
@@ -2696,12 +2847,13 @@ service_start() {
 
 status() {
 	local core_ok mihomo_ok dashboard_ok subscription_ok runtime_ok summary runtime_profile base_assets boot_restore luci_package
-	local snapshot snapshot_error snapshot_rc snapshot_ok error_excerpt core_version
-	local base_assets_ok base_assets_path base_assets_missing base_assets_policy base_assets_template base_assets_rule_source_dir base_assets_patch_count base_assets_patches_ok
-	local runtime_profile_path runtime_profile_exists runtime_profile_mode runtime_profile_core runtime_profile_core_path runtime_profile_source user_profile_path user_profile_exists
+	local snapshot snapshot_error snapshot_rc snapshot_ok snapshot_flags snapshot_fields extra error_excerpt
+	local core_version="" base_assets_ok base_assets_path="$STATE_DIR" base_assets_missing="" base_assets_policy="" base_assets_template=""
+	local base_assets_rule_source_dir="" base_assets_patch_count=0 base_assets_patches_ok=false
+	local runtime_profile_path="" runtime_profile_exists runtime_profile_mode="" runtime_profile_core="" runtime_profile_core_path=""
+	local runtime_profile_source="" user_profile_path="" user_profile_exists
 	local subscription_configured_value subscription_merged_value
 	core_ok="$(core_installed && echo true || echo false)"
-	core_version=""
 	if [ "$core_ok" = true ]; then
 		snapshot="/tmp/localclash-product-status.$$.json"
 		snapshot_error="${snapshot}.err"
@@ -2721,44 +2873,65 @@ status() {
 			return 1
 		fi
 
-		snapshot_ok="$(status_required_bool "$snapshot" '@.ok')" || snapshot_ok=""
-		base_assets_ok="$(status_required_bool "$snapshot" '@.status.components.base_assets.installed')" || base_assets_ok=""
-		mihomo_ok="$(status_required_bool "$snapshot" '@.status.components.mihomo.installed')" || mihomo_ok=""
-		dashboard_ok="$(status_required_bool "$snapshot" '@.status.components.dashboard.installed')" || dashboard_ok=""
-		runtime_profile_exists="$(status_required_bool "$snapshot" '@.status.config.runtime_profile.exists')" || runtime_profile_exists=""
-		user_profile_exists="$(status_required_bool "$snapshot" '@.status.config.runtime_profile.user_profile_exists')" || user_profile_exists=""
-		subscription_configured_value="$(status_required_bool "$snapshot" '@.status.subscription.configured')" || subscription_configured_value=""
-		subscription_merged_value="$(status_required_bool "$snapshot" '@.status.subscription.merged.exists')" || subscription_merged_value=""
-		runtime_ok="$(status_required_bool "$snapshot" '@.status.runtime.running')" || runtime_ok=""
-		if [ "$snapshot_ok" != true ] || [ -z "$base_assets_ok" ] || [ -z "$mihomo_ok" ] || [ -z "$dashboard_ok" ] ||
-			[ -z "$runtime_profile_exists" ] || [ -z "$user_profile_exists" ] || [ -z "$subscription_configured_value" ] ||
-			[ -z "$subscription_merged_value" ] || [ -z "$runtime_ok" ]; then
+		snapshot_flags="$(jsonfilter -i "$snapshot" \
+			-e '@.ok' \
+			-e '@.status.components.base_assets.installed' \
+			-e '@.status.components.mihomo.installed' \
+			-e '@.status.components.dashboard.installed' \
+			-e '@.status.config.runtime_profile.exists' \
+			-e '@.status.config.runtime_profile.user_profile_exists' \
+			-e '@.status.subscription.configured' \
+			-e '@.status.subscription.merged.exists' \
+			-e '@.status.runtime.running' 2>/dev/null)" || snapshot_flags=""
+		if ! {
+			IFS= read -r snapshot_ok &&
+			IFS= read -r base_assets_ok &&
+			IFS= read -r mihomo_ok &&
+			IFS= read -r dashboard_ok &&
+			IFS= read -r runtime_profile_exists &&
+			IFS= read -r user_profile_exists &&
+			IFS= read -r subscription_configured_value &&
+			IFS= read -r subscription_merged_value &&
+			IFS= read -r runtime_ok &&
+			! IFS= read -r extra
+		} <<EOF
+$snapshot_flags
+EOF
+		then
+			snapshot_ok=""
+		fi
+		if [ "$snapshot_ok" != true ] || ! status_booleans_valid "$base_assets_ok" "$mihomo_ok" "$dashboard_ok" \
+			"$runtime_profile_exists" "$user_profile_exists" "$subscription_configured_value" "$subscription_merged_value" "$runtime_ok"; then
 			rm -f "$snapshot" "$snapshot_error"
 			fail_with_details "core_status_invalid" "localClash 核心状态回复缺少必要字段；配置、组件、订阅和运行时状态均未知。工作区未被判定为已重置。" '"core":{"installed":true,"path":"'"$(json_escape "$CORE")"'","state":"unavailable"}'
 			return 1
 		fi
 
-		core_version="$(jsonfilter -i "$snapshot" -e '@.status.components.localclash.version' 2>/dev/null || true)"
-		base_assets_path="$(jsonfilter -i "$snapshot" -e '@.status.components.base_assets.path' 2>/dev/null || printf '%s' "$STATE_DIR")"
-		base_assets_missing="$(jsonfilter -i "$snapshot" -e '@.status.components.base_assets.missing[*]' 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
-		base_assets_policy="$(jsonfilter -i "$snapshot" -e '@.status.components.base_assets.policy' 2>/dev/null || true)"
-		base_assets_template="$(jsonfilter -i "$snapshot" -e '@.status.components.base_assets.default_template' 2>/dev/null || true)"
-		base_assets_rule_source_dir="$(jsonfilter -i "$snapshot" -e '@.status.components.base_assets.rule_source_dir' 2>/dev/null || true)"
-		base_assets_patch_count="$(jsonfilter -i "$snapshot" -e '@.status.components.base_assets.default_patch_count' 2>/dev/null || printf 0)"
+		# jsonfilter shell-quotes the values for these fixed export names.
+		snapshot_fields="$(jsonfilter -i "$snapshot" \
+			-e 'core_version=@.status.components.localclash.version' \
+			-e 'base_assets_path=@.status.components.base_assets.path' \
+			-e 'base_assets_missing=@.status.components.base_assets.missing[*]' \
+			-e 'base_assets_policy=@.status.components.base_assets.policy' \
+			-e 'base_assets_template=@.status.components.base_assets.default_template' \
+			-e 'base_assets_rule_source_dir=@.status.components.base_assets.rule_source_dir' \
+			-e 'base_assets_patch_count=@.status.components.base_assets.default_patch_count' \
+			-e 'base_assets_patches_ok=@.status.components.base_assets.default_patches_installed' \
+			-e 'runtime_profile_path=@.status.config.runtime_profile.path' \
+			-e 'runtime_profile_mode=@.status.config.runtime_profile.mode' \
+			-e 'runtime_profile_core=@.status.config.runtime_profile.core' \
+			-e 'runtime_profile_core_path=@.status.config.runtime_profile.core_path' \
+			-e 'runtime_profile_source=@.status.config.runtime_profile.runtime_source' \
+			-e 'user_profile_path=@.status.config.runtime_profile.user_profile_path' 2>/dev/null)" || true
+		eval "$snapshot_fields"
+
 		case "$base_assets_patch_count" in ''|*[!0-9]*) base_assets_patch_count=0 ;; esac
-		base_assets_patches_ok="$(jsonfilter -i "$snapshot" -e '@.status.components.base_assets.default_patches_installed' 2>/dev/null || printf false)"
-		case "$base_assets_patches_ok" in true|false) ;; *) base_assets_patches_ok=false ;; esac
+		case "$base_assets_patches_ok" in 1|true) base_assets_patches_ok=true ;; *) base_assets_patches_ok=false ;; esac
 		if [ "$base_assets_patch_count" -gt 0 ]; then
 			base_assets_template="patch_set"
 		fi
 		base_assets='"base_assets":{"installed":'"$base_assets_ok"',"path":"'"$(json_escape "$base_assets_path")"'","source":"localclash-core","missing":"'"$(json_escape "$base_assets_missing")"'","policy":"'"$(json_escape "$base_assets_policy")"'","default_template":"'"$(json_escape "$base_assets_template")"'","rule_source_dir":"'"$(json_escape "$base_assets_rule_source_dir")"'","default_patch_count":'"$base_assets_patch_count"',"default_patches_installed":'"$base_assets_patches_ok"'}'
 
-		runtime_profile_path="$(jsonfilter -i "$snapshot" -e '@.status.config.runtime_profile.path' 2>/dev/null || true)"
-		runtime_profile_mode="$(jsonfilter -i "$snapshot" -e '@.status.config.runtime_profile.mode' 2>/dev/null || true)"
-		runtime_profile_core="$(jsonfilter -i "$snapshot" -e '@.status.config.runtime_profile.core' 2>/dev/null || true)"
-		runtime_profile_core_path="$(jsonfilter -i "$snapshot" -e '@.status.config.runtime_profile.core_path' 2>/dev/null || true)"
-		runtime_profile_source="$(jsonfilter -i "$snapshot" -e '@.status.config.runtime_profile.runtime_source' 2>/dev/null || true)"
-		user_profile_path="$(jsonfilter -i "$snapshot" -e '@.status.config.runtime_profile.user_profile_path' 2>/dev/null || true)"
 		runtime_profile='"runtime_profile":{"path":"'"$(json_escape "$runtime_profile_path")"'","exists":'"$runtime_profile_exists"',"mode":"'"$(json_escape "$runtime_profile_mode")"'","core":"'"$(json_escape "$runtime_profile_core")"'","core_path":"'"$(json_escape "$runtime_profile_core_path")"'","runtime_source":"'"$(json_escape "$runtime_profile_source")"'","user_profile_path":"'"$(json_escape "$user_profile_path")"'","user_profile_exists":'"$user_profile_exists"'}'
 		if [ "$subscription_configured_value" = true ] && [ "$subscription_merged_value" = true ]; then subscription_ok=true; else subscription_ok=false; fi
 		rm -f "$snapshot" "$snapshot_error"
@@ -3399,7 +3572,7 @@ one_click_update_continue_execute() {
 		fi
 		subscription_refresh_json="$(cat "$tmpdir/subscription-refresh.json")"
 	elif [ "$subscription_ready" = "true" ]; then
-		subscription_refresh_json='{"ok":true,"changed":false,"deferred":true,"summary":"订阅刷新将与默认策略和能力快照在同一材料事务中提交。"}'
+		subscription_refresh_json='{"ok":true,"changed":false,"deferred":true,"summary":"订阅刷新和线路池准备将随默认策略一起处理。"}'
 		log_line "一键更新：订阅刷新已并入默认策略材料事务"
 	else
 		subscription_refresh_json='{"ok":true,"changed":false,"summary":"未配置订阅，跳过订阅和配置材料检查点。","skipped":true}'
@@ -3911,6 +4084,241 @@ custom_sites_transact_run() {
 	custom_sites_transact < "$TASK_INPUT"
 }
 
+pool_schedule_config_value() {
+	"$UCI_BIN" -q get "localclash.pool_schedule.$1" 2>/dev/null || printf '%s\n' "$2"
+}
+
+pool_capability_get() {
+	local result enabled
+	if result="$(call_core config pools --json)"; then
+		enabled="$(jsonfilter -s "$result" -e '@.status.enabled' 2>/dev/null)"
+		case "$enabled" in
+			true|false) printf '%s\n' "$result"; return 0 ;;
+		esac
+	fi
+	if [ "$(jsonfilter -s "$result" -e '@.ok' 2>/dev/null)" = false ]; then
+		printf '%s\n' "$result"
+		return 1
+	fi
+	fail "pool_capability_unavailable" "更新 localClash 核心后可设置线路池开关。"
+	return 1
+}
+
+pool_capability_value() {
+	local result
+	result="$(pool_capability_get)" || {
+		printf '%s\n' "$result"
+		return 1
+	}
+	jsonfilter -s "$result" -e '@.status.enabled' 2>/dev/null
+}
+
+start_pool_capability_set() {
+	local payload enabled task_id bg_pid
+	payload="$(strip_ubus_rpc_session "$(cat)")"
+	enabled="$(jsonfilter -s "$payload" -e '@.enabled' 2>/dev/null)"
+	case "$enabled" in
+		true|false) ;;
+		*) fail "pool_capability_enabled_invalid" "请选择是否启用线路池。"; return 1 ;;
+	esac
+	clear_stale_lock
+	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+		fail "task_locked" "另一个 localClash 操作正在运行，请稍后再试。"
+		return 1
+	fi
+	printf '%s\n' "$$" > "$LOCK_DIR/pid"
+	if task_pid_alive; then
+		rm -rf "$LOCK_DIR"
+		fail "task_locked" "另一个 localClash 后台任务正在收尾，请稍后再试。"
+		return 1
+	fi
+	task_id="$(now_epoch)-$$"
+	rm -f "$TASK_RESULT" "$TASK_INPUT" "$TASK_PID"
+	: > "$LOG"
+	if ! write_task_running "正在应用线路池设置。" pool_capability "$task_id"; then
+		rm -rf "$LOCK_DIR"
+		fail "task_status_write_failed" "无法记录线路池任务。"
+		return 1
+	fi
+	"$HELPER_SELF" call pool_capability_set_run "$task_id" "$enabled" </dev/null >>"$LOG" 2>&1 &
+	bg_pid="$!"
+	write_task_pid "$bg_pid"
+	printf '%s\n' "$bg_pid" > "$LOCK_DIR/pid"
+	ok '"started":true,"running":true,"task":"pool_capability","task_id":"'"$task_id"'","cancellable":false'
+}
+
+apply_pool_capability() {
+	local result enabled
+	enabled="$1"
+	if ! result="$(call_core config pools --enabled "$enabled" --json)"; then
+		if [ "$(jsonfilter -s "$result" -e '@.ok' 2>/dev/null)" = false ]; then
+			printf '%s\n' "$result"
+		else
+			fail "pool_capability_apply_failed" "应用线路池设置失败，请检查任务日志。"
+		fi
+		return 1
+	fi
+	if [ "$(jsonfilter -s "$result" -e '@.status.enabled' 2>/dev/null)" != "$enabled" ]; then
+		fail "pool_capability_readback_failed" "无法确认线路池设置已应用。"
+		return 1
+	fi
+	if [ -x "$POOL_SCHEDULER_SERVICE" ] &&
+		! pool_schedule_service_apply "$(pool_schedule_config_value enabled 0)" >>"$LOG" 2>&1; then
+		ok '"summary":"线路池设置已应用，定时更新服务未能同步。","schedule_applied":false,"pool_config":'"$result"
+		return 0
+	fi
+	printf '%s\n' "$result"
+}
+
+pool_capability_set_run() {
+	local task_id enabled waited result rc
+	task_id="$1"
+	enabled="$2"
+	waited=0
+	while [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" != "$$" ]; do
+		[ "$waited" -lt 5 ] || return 1
+		waited=$((waited + 1))
+		sleep 1
+	done
+	trap '[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" != "$$" ] || rm -rf "$LOCK_DIR"' EXIT
+	trap 'exit 143' INT TERM
+	[ -n "$task_id" ] && [ "$(jsonfilter -i "$TASK_STATUS" -e '@.task_id' 2>/dev/null)" = "$task_id" ] || return 1
+	case "$enabled" in true|false) ;; *) return 1 ;; esac
+	log_line "线路池：正在应用能力开关"
+	result="$(apply_pool_capability "$enabled")"
+	rc=$?
+	printf '%s\n' "$result" > "$TASK_RESULT"
+	write_task_done "$rc" "$result"
+	rm -f "$TASK_PID"
+	return "$rc"
+}
+
+pool_schedule_period_valid() {
+	case "$1" in 5m|15m|30m|1h|daily-08) return 0 ;; esac
+	return 1
+}
+
+pool_schedule_get() {
+	local enabled period available arch status_file next_run last_run outcome
+	command -v "$UCI_BIN" >/dev/null 2>&1 || {
+		fail "uci_missing" "缺少 uci，无法读取线路池定时更新设置。"
+		return 1
+	}
+	enabled="$(pool_schedule_config_value enabled 0)"
+	period="$(pool_schedule_config_value period 15m)"
+	case "$enabled" in
+		0) enabled=false ;;
+		1) enabled=true ;;
+		*) fail "pool_schedule_enabled_invalid" "线路池定时更新配置无效。"; return 1 ;;
+	esac
+	pool_schedule_period_valid "$period" || {
+		fail "pool_schedule_period_invalid" "线路池更新周期无效。"
+		return 1
+	}
+	available=false
+	if arch="$(router_arch)" && [ -x "$STATE_DIR/bin/linux-$arch/localclash-pools" ]; then
+		available=true
+	fi
+	status_file="$STATE_DIR/.runtime/mihomo/qualified-pools/schedule.json"
+	outcome=
+	if [ -r "$status_file" ]; then
+		next_run="$(jsonfilter -i "$status_file" -e '@.next_run_at' 2>/dev/null || true)"
+		last_run="$(jsonfilter -i "$status_file" -e '@.last_run_at' 2>/dev/null || true)"
+		if [ -n "$last_run" ]; then
+			outcome=success
+			if [ -n "$(jsonfilter -i "$status_file" -e '@.error' 2>/dev/null || true)" ]; then
+				outcome=error
+			fi
+		fi
+	fi
+	if [ "$enabled" != true ] || ! "$POOL_SCHEDULER_SERVICE" running >/dev/null 2>&1 || [ "$(pool_capability_value)" != true ]; then
+		next_run=
+	fi
+	printf '{"ok":true,"available":%s,"schedule":{"enabled":%s,"period":"%s"},"next_run_at":"%s","last_run_at":"%s","outcome":"%s"}\n' \
+		"$available" "$enabled" "$period" "$(json_escape "$next_run")" "$(json_escape "$last_run")" "$outcome"
+}
+
+pool_schedule_service_apply() {
+	local pool_enabled=false
+	if [ "$1" = 1 ]; then
+		pool_enabled="$(pool_capability_value)" || return 1
+	fi
+	if [ "$pool_enabled" = true ]; then
+		LOCALCLASH_STATE_DIR="$STATE_DIR" "$POOL_SCHEDULER_SERVICE" enable &&
+			LOCALCLASH_STATE_DIR="$STATE_DIR" "$POOL_SCHEDULER_SERVICE" restart
+	else
+		if "$POOL_SCHEDULER_SERVICE" running; then
+			"$POOL_SCHEDULER_SERVICE" stop || return 1
+		fi
+		"$POOL_SCHEDULER_SERVICE" disable
+	fi
+}
+
+pool_schedule_set() {
+	local payload enabled period pool_enabled arch previous_section previous_enabled previous_period rollback_rc
+	payload="$(strip_ubus_rpc_session "$(cat)")"
+	enabled="$(jsonfilter -s "$payload" -e '@.enabled' 2>/dev/null || true)"
+	period="$(jsonfilter -s "$payload" -e '@.period' 2>/dev/null || true)"
+	case "$enabled" in
+		true) enabled=1 ;;
+		false) enabled=0 ;;
+		*) fail "pool_schedule_enabled_invalid" "请选择是否启用线路池定时更新。"; return 1 ;;
+	esac
+	pool_schedule_period_valid "$period" || {
+		fail "pool_schedule_period_invalid" "请选择支持的线路池更新周期。"
+		return 1
+	}
+	[ -x "$POOL_SCHEDULER_SERVICE" ] && command -v "$UCI_BIN" >/dev/null 2>&1 || {
+		fail "pool_scheduler_service_missing" "线路池定时更新服务未安装。"
+		return 1
+	}
+	if [ "$enabled" = 1 ]; then
+		pool_enabled="$(pool_capability_value)" || {
+			printf '%s\n' "$pool_enabled"
+			return 1
+		}
+		if [ "$pool_enabled" = true ] && { ! arch="$(router_arch)" || [ ! -x "$STATE_DIR/bin/linux-$arch/localclash-pools" ]; }; then
+			fail "pool_worker_missing" "请先更新 localClash 核心和基础资产，再启用线路池定时更新。"
+			return 1
+		fi
+	fi
+	previous_section="$("$UCI_BIN" -q get localclash.pool_schedule 2>/dev/null)" || previous_section=
+	previous_enabled="$("$UCI_BIN" -q get localclash.pool_schedule.enabled 2>/dev/null)" || previous_enabled=
+	previous_period="$("$UCI_BIN" -q get localclash.pool_schedule.period 2>/dev/null)" || previous_period=
+	if "$UCI_BIN" -q set localclash.pool_schedule=pool_schedule &&
+		"$UCI_BIN" -q set "localclash.pool_schedule.enabled=$enabled" &&
+		"$UCI_BIN" -q set "localclash.pool_schedule.period=$period" &&
+		"$UCI_BIN" -q commit localclash &&
+		pool_schedule_service_apply "$enabled" >/dev/null 2>&1; then
+		pool_schedule_get
+		return $?
+	fi
+	rollback_rc=0
+	if [ -n "$previous_section" ]; then
+		"$UCI_BIN" -q set "localclash.pool_schedule=$previous_section" || rollback_rc=1
+		if [ -n "$previous_enabled" ]; then
+			"$UCI_BIN" -q set "localclash.pool_schedule.enabled=$previous_enabled" || rollback_rc=1
+		else
+			"$UCI_BIN" -q delete localclash.pool_schedule.enabled || true
+		fi
+		if [ -n "$previous_period" ]; then
+			"$UCI_BIN" -q set "localclash.pool_schedule.period=$previous_period" || rollback_rc=1
+		else
+			"$UCI_BIN" -q delete localclash.pool_schedule.period || true
+		fi
+	else
+		"$UCI_BIN" -q delete localclash.pool_schedule || true
+	fi
+	"$UCI_BIN" -q commit localclash || rollback_rc=1
+	pool_schedule_service_apply "${previous_enabled:-0}" >/dev/null 2>&1 || rollback_rc=1
+	if [ "$rollback_rc" = 0 ]; then
+		fail "pool_schedule_save_failed" "线路池定时更新设置保存失败，已恢复原设置。"
+	else
+		fail "pool_schedule_rollback_failed" "线路池定时更新设置保存失败，原设置恢复不完整。"
+	fi
+	return 1
+}
+
 subscription_schedule_config() {
 	local enabled update_hour
 	command -v "$UCI_BIN" >/dev/null 2>&1 || {
@@ -3957,7 +4365,8 @@ subscription_schedule_json_file() {
 }
 
 subscription_schedule_get() {
-	local config last_run runtime runtime_pid
+	local config last_run runtime runtime_pid saved_fields
+	saved_fields="${1:-}"
 	config="$(subscription_schedule_config)" || {
 		printf '%s\n' "$config"
 		return 1
@@ -3977,7 +4386,7 @@ subscription_schedule_get() {
 			*) kill -0 "$runtime_pid" 2>/dev/null || { rm -f "$SUBSCRIPTION_SCHEDULE_RUNTIME"; runtime=null; } ;;
 		esac
 	fi
-	printf '{"ok":true,"schedule":%s,"last_run":%s,"runtime":%s}\n' "$config" "$last_run" "$runtime"
+	ok "${saved_fields}\"schedule\":$config,\"last_run\":$last_run,\"runtime\":$runtime"
 }
 
 subscription_schedule_write_file() {
@@ -4090,7 +4499,7 @@ subscription_schedule_takeover_readback() {
 }
 
 subscription_schedule_run_locked() {
-	local source tmpdir started runtime_before pid_before running takeover_before profile_before refresh_state hot_reload_ready config_sha restart_error reloaded strategy restart_sha pid_after completed result
+	local source tmpdir started runtime_before pid_before running takeover_before profile_before refresh_state hot_reload_ready config_sha restart_error reloaded strategy restart_sha pid_after completed result warnings_json
 	source="$1"
 	started="$(now_epoch)"
 	tmpdir="$(mktemp -d /tmp/localclash-subscription-schedule.XXXXXX)" || {
@@ -4146,6 +4555,8 @@ subscription_schedule_run_locked() {
 		return 1
 	fi
 	mv "$tmpdir/refresh-response.json" "$tmpdir/refresh.json"
+	warnings_json="$(jsonfilter -i "$tmpdir/refresh.json" -e '@.result.structuredContent.warnings' 2>/dev/null || true)"
+	warnings_json="${warnings_json:-[]}"
 	refresh_state="$(jsonfilter -i "$tmpdir/refresh.json" -e '@.result.structuredContent.localclash_config.state' 2>/dev/null || true)"
 	hot_reload_ready="$(jsonfilter -i "$tmpdir/refresh.json" -e '@.result.structuredContent.localclash_config.hot_reload_ready' 2>/dev/null || true)"
 	if [ "$hot_reload_ready" != true ]; then
@@ -4172,7 +4583,7 @@ subscription_schedule_run_locked() {
 
 	if [ "$running" = false ]; then
 		completed="$(now_epoch)"
-		result='{"version":1,"ok":true,"source":"'"$(json_escape "$source")"'","outcome":"pending_next_start","stage":"complete","message":"订阅已刷新并通过配置验证；运行时原本未启动，未执行热加载。","started_at":'"$started"',"completed_at":'"$completed"',"runtime_was_running":false,"config_sha256":"'"$(json_escape "$config_sha")"'"}'
+		result='{"version":1,"ok":true,"source":"'"$(json_escape "$source")"'","outcome":"pending_next_start","stage":"complete","message":"订阅配置已通过验证，将在运行时下次启动时使用。","started_at":'"$started"',"completed_at":'"$completed"',"runtime_was_running":false,"config_sha256":"'"$(json_escape "$config_sha")"'","warnings":'"$warnings_json"'}'
 		rm -rf "$tmpdir"
 		subscription_schedule_finish "$result"
 		return 0
@@ -4186,7 +4597,7 @@ subscription_schedule_run_locked() {
 			pid_after="$(jsonfilter -i "$tmpdir/indeterminate-runtime.json" -e '@.result.structuredContent.pid' 2>/dev/null || true)"
 			if [ "$pid_after" = "$pid_before" ] && subscription_schedule_takeover_readback "$tmpdir/indeterminate-takeover.json" "$takeover_before" "$profile_before"; then
 				completed="$(now_epoch)"
-				result='{"version":1,"ok":true,"source":"'"$(json_escape "$source")"'","outcome":"reloaded_after_indeterminate_call","stage":"complete","message":"MCP 热加载调用结果不确定，但运行时语义读回已确认新订阅配置生效。","started_at":'"$started"',"completed_at":'"$completed"',"runtime_was_running":true,"pid":'"$pid_after"',"config_sha256":"'"$(json_escape "$config_sha")"'","takeover_effective":'"$takeover_before"',"profile_mode":"'"$(json_escape "$profile_before")"'","warning":"'"$(json_escape "$restart_error")"'"}'
+				result='{"version":1,"ok":true,"source":"'"$(json_escape "$source")"'","outcome":"reloaded_after_indeterminate_call","stage":"complete","message":"MCP 热加载调用结果不确定，但运行时语义读回已确认新订阅配置生效。","started_at":'"$started"',"completed_at":'"$completed"',"runtime_was_running":true,"pid":'"$pid_after"',"config_sha256":"'"$(json_escape "$config_sha")"'","takeover_effective":'"$takeover_before"',"profile_mode":"'"$(json_escape "$profile_before")"'","warning":"'"$(json_escape "$restart_error")"'","warnings":'"$warnings_json"'}'
 				rm -rf "$tmpdir"
 				subscription_schedule_finish "$result"
 				return 0
@@ -4224,7 +4635,7 @@ subscription_schedule_run_locked() {
 		return 1
 	fi
 	completed="$(now_epoch)"
-	result='{"version":1,"ok":true,"source":"'"$(json_escape "$source")"'","outcome":"reloaded","stage":"complete","message":"订阅已刷新、验证并热加载，运行时读回成功。","started_at":'"$started"',"completed_at":'"$completed"',"runtime_was_running":true,"pid":'"$pid_after"',"config_sha256":"'"$(json_escape "$config_sha")"'","refresh_state":"'"$(json_escape "$refresh_state")"'","takeover_effective":'"$takeover_before"',"profile_mode":"'"$(json_escape "$profile_before")"'"}'
+	result='{"version":1,"ok":true,"source":"'"$(json_escape "$source")"'","outcome":"reloaded","stage":"complete","message":"订阅配置已验证并热加载，运行时读回成功。","started_at":'"$started"',"completed_at":'"$completed"',"runtime_was_running":true,"pid":'"$pid_after"',"config_sha256":"'"$(json_escape "$config_sha")"'","refresh_state":"'"$(json_escape "$refresh_state")"'","takeover_effective":'"$takeover_before"',"profile_mode":"'"$(json_escape "$profile_before")"'","warnings":'"$warnings_json"'}'
 	rm -rf "$tmpdir"
 	subscription_schedule_finish "$result"
 }
@@ -4328,7 +4739,7 @@ subscription_schedule_set() {
 		fi
 		return 1
 	fi
-	printf '{"ok":true,"changed":true,"schedule":{"enabled":%s,"update_hour":%s},"summary":"订阅定时更新配置已保存。"}\n' "$enabled" "$update_hour"
+	subscription_schedule_get '"changed":true,"summary":"订阅定时更新配置已保存。",'
 }
 
 start_subscription_schedule_run() {
@@ -4416,7 +4827,7 @@ subscription_save_refresh_file() {
 }
 
 subscription_setup_file() {
-	local input tmpdir restart_json
+	local input tmpdir restart_json warnings_json
 	input="$1"
 	tmpdir="$(mktemp -d /tmp/localclash-subscription.XXXXXX)" || {
 		fail "tmpdir_failed" "无法创建临时订阅目录。"
@@ -4450,10 +4861,11 @@ subscription_setup_file() {
 		return 1
 	fi
 	restart_json="$(cat "$tmpdir/restart.json")"
+	warnings_json="$(jsonfilter -i "$tmpdir/refresh.json" -e '@.warnings' 2>/dev/null || true)"
 
 	rm -rf "$tmpdir"
 	log_line "订阅设置：已完成"
-	printf '{"ok":true,"changed":true,"summary":"订阅已保存、刷新，配置已生成，运行时已重启并验证生效。","runtime_restart":%s,"next_actions":[]}\n' "$restart_json"
+	printf '{"ok":true,"changed":true,"summary":"订阅已保存，配置已生成，运行时已重启并验证生效。","runtime_restart":%s,"warnings":%s,"next_actions":[]}\n' "$restart_json" "${warnings_json:-[]}"
 }
 
 write_bootstrap_subscription_input() {
@@ -4559,7 +4971,7 @@ reset() {
 }
 
 bootstrap_core() {
-	local arch tmpdir manifest binary asset_url asset_sha asset_version tmp_core service_result
+	local arch tmpdir manifest binary asset_url asset_sha asset_version tmp_core service_result changed summary
 	log_line "核心初始化：开始"
 	if ! command -v jsonfilter >/dev/null 2>&1; then
 		log_line "核心初始化：缺少 jsonfilter"
@@ -4593,24 +5005,31 @@ bootstrap_core() {
 		fail "manifest_asset_missing" "Release 清单中没有匹配此路由器的 Linux 二进制文件。"
 		return 1
 	fi
-	log_line "核心初始化：正在下载 localClash 核心 ${asset_version}（${arch}）"
-	if ! fetch_url_verified "$asset_url" "$binary" "$asset_sha"; then
-		rm -rf "$tmpdir"
-		log_line "核心初始化：核心下载失败"
-		fail "core_download_failed" "无法下载 localClash 核心二进制文件。"
-		return 1
-	fi
-	log_line "核心初始化：sha256 校验通过"
-	chmod 755 "$binary"
-	mkdir -p "$(dirname "$CORE")"
-	tmp_core="$CORE.tmp.$$"
-	log_line "核心初始化：正在安装 localClash 核心"
-	if ! cp "$binary" "$tmp_core" || ! chmod 755 "$tmp_core" || ! mv "$tmp_core" "$CORE"; then
-		rm -f "$tmp_core"
-		rm -rf "$tmpdir"
-		log_line "核心初始化：核心安装失败"
-		fail "core_install_failed" "无法安装 localClash 核心二进制文件。"
-		return 1
+	if core_installed && [ "$(sha256sum "$CORE" 2>/dev/null | cut -d ' ' -f 1)" = "$asset_sha" ]; then
+		changed=false
+		summary="localClash 核心已是当前版本。"
+		log_line "核心初始化：已安装的核心与 Release SHA-256 一致"
+	else
+		changed=true
+		summary="localClash 核心已安装。"
+		log_line "核心初始化：正在下载 localClash 核心 ${asset_version}（${arch}）"
+		if ! fetch_url_verified "$asset_url" "$binary" "$asset_sha"; then
+			rm -rf "$tmpdir"
+			log_line "核心初始化：核心下载失败"
+			fail "core_download_failed" "无法下载 localClash 核心二进制文件。"
+			return 1
+		fi
+		log_line "核心初始化：sha256 校验通过"
+		mkdir -p "$(dirname "$CORE")"
+		tmp_core="$CORE.tmp.$$"
+		log_line "核心初始化：正在安装 localClash 核心"
+		if ! cp "$binary" "$tmp_core" || ! chmod 755 "$tmp_core" || ! mv "$tmp_core" "$CORE"; then
+			rm -f "$tmp_core"
+			rm -rf "$tmpdir"
+			log_line "核心初始化：核心安装失败"
+			fail "core_install_failed" "无法安装 localClash 核心二进制文件。"
+			return 1
+		fi
 	fi
 	service_result="$(service_start)" || {
 		rm -rf "$tmpdir"
@@ -4627,12 +5046,12 @@ bootstrap_core() {
 		return 1
 	fi
 	rm -rf "$tmpdir"
-	log_line "已安装 localClash 核心 ${asset_version}（${arch}）"
-	ok "\"changed\":true,\"summary\":\"localClash 核心已安装。\",\"core\":{\"installed\":true,\"path\":\"$CORE\",\"version\":\"$(json_escape "$asset_version")\",\"arch\":\"$arch\"}"
+	log_line "$summary ${asset_version}（${arch}）"
+	ok "\"changed\":$changed,\"summary\":\"$summary\",\"core\":{\"installed\":true,\"path\":\"$CORE\",\"version\":\"$(json_escape "$asset_version")\",\"arch\":\"$arch\"}"
 }
 
 install_base_assets() {
-	local output
+	local output assets_changed
 	output="/tmp/localclash-base-assets.$$.json"
 	if ! core_installed; then
 		fail "bootstrap_core_missing" "localClash 核心尚未安装，无法初始化基础文件。"
@@ -4640,13 +5059,25 @@ install_base_assets() {
 	fi
 	mkdir -p "$STATE_DIR"
 	log_line "基础文件初始化：交由 localClash 核心安装基础文件"
-	if ! call_core component update assets --json > "$output"; then
+	if ! LOCALCLASH_RELEASE_MANIFEST_FILE="${1:-}" call_core component update assets --json > "$output"; then
 		log_line "基础文件初始化：核心安装基础文件失败"
 		cat "$output"
 		rm -f "$output"
 		return 1
 	fi
-	log_line "基础文件初始化：已由 localClash 核心安装"
+	assets_changed="$(jsonfilter -i "$output" -e '@.changed' 2>/dev/null || true)"
+	if [ -x "$POOL_SCHEDULER_SERVICE" ] && [ "$(pool_schedule_config_value enabled 0)" = 1 ]; then
+		if ! pool_schedule_service_apply 1 >/dev/null 2>&1; then
+			rm -f "$output"
+			fail "pool_scheduler_restart_failed" "基础文件已更新，但线路池定时更新服务重启失败。"
+			return 1
+		fi
+	fi
+	if [ "$assets_changed" = false ]; then
+		log_line "基础文件初始化：已安装文件与 Release 一致"
+	else
+		log_line "基础文件初始化：已由 localClash 核心安装"
+	fi
 	rm -f "$output"
 	return 0
 }
@@ -5598,6 +6029,7 @@ case "$method" in
 		cat <<'JSON'
 {
 	  "status": {},
+	  "dashboard_config": {},
 	  "subscription_get": {},
 	  "subscription_set": { "uris": [] },
 	  "subscription_setup": { "uris": [] },
@@ -5606,6 +6038,10 @@ case "$method" in
 	  "subscription_schedule_get": {},
 	  "subscription_schedule_set": { "enabled": false, "update_hour": 0 },
 	  "subscription_schedule_run_now": {},
+	  "pool_capability_get": {},
+	  "pool_capability_set_async": { "enabled": false },
+	  "pool_schedule_get": {},
+	  "pool_schedule_set": { "enabled": false, "period": "" },
 	  "custom_sites_get": {},
 	  "custom_sites_transact": { "operation": "", "pattern": "", "route": "", "id": "" },
 	  "custom_sites_transact_async": { "operation": "", "pattern": "", "route": "", "id": "" },
@@ -5628,7 +6064,7 @@ case "$method" in
   "boot_restore_disable": {},
 	  "boot_restore_startup_run": {},
 	  "boot_restore_run": {},
-	  "takeover_status": {},
+	  "takeover_status": { "probe_dns": true },
 	  "takeover_logs": {},
 	  "takeover_apply": {},
   "takeover_restore": {},
@@ -5651,6 +6087,7 @@ case "$method" in
 JSON
 		;;
 	status) status ;;
+	dashboard_config) dashboard_config ;;
 	subscription_get) subscription_get ;;
 	subscription_set) subscription_set ;;
 	subscription_setup) with_lock subscription_setup ;;
@@ -5660,6 +6097,11 @@ JSON
 	subscription_schedule_get) subscription_schedule_get ;;
 	subscription_schedule_set) with_lock subscription_schedule_set ;;
 	subscription_schedule_run_now) start_subscription_schedule_run ;;
+	pool_capability_get) pool_capability_get ;;
+	pool_capability_set_async) start_pool_capability_set ;;
+	pool_capability_set_run) pool_capability_set_run "${3:-}" "${4:-}" ;;
+	pool_schedule_get) pool_schedule_get ;;
+	pool_schedule_set) with_lock pool_schedule_set ;;
 	subscription_schedule_run_task) subscription_schedule_run_task "${3:-}" ;;
 	subscription_schedule_tick) subscription_schedule_tick ;;
 	custom_sites_get) custom_sites_get ;;
@@ -5691,7 +6133,7 @@ JSON
 	boot_restore_disable) with_lock boot_restore_disable ;;
 	boot_restore_startup_run) with_lock boot_restore_startup_run ;;
 	boot_restore_run) with_lock boot_restore_run ;;
-	takeover_status) call_takeover status --json ;;
+	takeover_status) takeover_status ;;
 	takeover_logs) takeover_logs ;;
 	takeover_apply) with_lock takeover_apply ;;
 	takeover_restore) with_lock takeover_restore_run ;;

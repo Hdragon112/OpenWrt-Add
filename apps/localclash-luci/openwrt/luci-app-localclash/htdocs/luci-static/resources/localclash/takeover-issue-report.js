@@ -80,12 +80,89 @@ function evidenceJSON(source) {
 	catch (e) { return null; }
 }
 
+function takeoverRecovery(event) {
+	if (event.event === 'restore_finished' && event.result === 'already_effective')
+		return '确认接管已生效';
+	if (event.result === 'success' && (event.event === 'repair_apply_finished' ||
+		event.event === 'runtime_takeover_finished' ||
+		(event.event === 'apply_finished' && event.effective === 'true') ||
+		(event.event === 'runtime_restart_finished' && event.takeover_transition === 'restored')))
+		return '接管恢复并验证生效';
+	return null;
+}
+
+function takeoverEventHistory(lines, bootID) {
+	var failures = [];
+	var pending = [];
+	var failedOperations = new Set();
+	var invalidEvents = 0;
+	lines.forEach(function(line) {
+		var event;
+		try { event = JSON.parse(line); }
+		catch (e) { invalidEvents++; return; }
+		if (!event || !bootID || bootID === 'unknown' || event.boot_id !== bootID)
+			return;
+		var operation = event.event_id && event.source + '/' + event.event_id;
+		// The interface hotplug ID is a PID and may be reused.
+		if (operation && /_started$/.test(event.event))
+			failedOperations.delete(operation);
+
+		var recovery = takeoverRecovery(event);
+		if (recovery) {
+			var outcome = { timestamp: event.timestamp, source: event.source, summary: recovery };
+			pending = pending.filter(function(record) {
+				if (event.uptime_seconds < record.event.uptime_seconds)
+					return true;
+				record.recovery = outcome;
+				return false;
+			});
+			return;
+		}
+		var failed = event.event === 'status_failed' || (event.result === 'failure' &&
+			([ 'apply_finished', 'repair_apply_finished', 'restore_finished', 'runtime_takeover_finished' ].indexOf(event.event) >= 0 ||
+				(event.event === 'runtime_restart_finished' && event.stage === 'takeover_restore')));
+		if (!failed || (operation && failedOperations.has(operation)))
+			return;
+		var record = { event: event, recovery: null };
+		failures.push(record);
+		pending.push(record);
+		if (operation)
+			failedOperations.add(operation);
+	});
+	return { failures: failures.reverse(), invalidEvents: invalidEvents };
+}
+
+function recoveryText(recovery) {
+	if (!recovery)
+		return ' 后续暂无接管恢复验证记录。';
+	return ' ' + (recovery.timestamp || '时间未知') + ' ' + recovery.summary +
+		(recovery.source ? '（' + recovery.source + '）' : '') + '。';
+}
+
 function reportSummary(logs) {
 	var lines = [ '## 已记录的失败与采集缺口', '' ];
 	var evidence = logs.evidence || {};
+	var observation = logs.runtime_observation;
 	var failure = evidenceJSON(evidence.last_failure);
+	var history = takeoverEventHistory(logs.events, logs.boot_id);
+	var snapshotEvent = failure && failure.event_id && history.failures.find(function(record) {
+		var event = record.event;
+		var code = failure.result && failure.result.code;
+		return event.boot_id === failure.boot_id && event.event_id === failure.event_id && event.source === failure.source &&
+			(!code || !event.core_code || event.core_code === code);
+	});
+	if (observation) {
+		var dns = observation.dns || {};
+		if (observation.runtime_running === true && observation.controller_ready === false)
+			lines.push('- 概述页记录到 Mihomo 进程仍在运行，控制器未响应。');
+		if (dns.probe) {
+			var probe = dns.probe;
+			lines.push('- 概述页 DNS 检测 ' + probe.state + '（' + probe.observed_at + '，' + probe.query + '，接管路径 ' + dns.path + '）。');
+		}
+	}
 	if (failure) {
-		lines.push('- 最近失败：' + failure.timestamp + '；来源 ' + failure.source + '；阶段 ' + failure.stage + '；退出码 ' + failure.exit_code + '。');
+		lines.push('- 最近失败：' + failure.timestamp + '；来源 ' + failure.source + '；阶段 ' + failure.stage + '；退出码 ' + failure.exit_code + '。' +
+			(snapshotEvent ? recoveryText(snapshotEvent.recovery) : ''));
 		if (failure.boot_id !== logs.boot_id)
 			lines.push('- 该失败来自另一轮开机：' + failure.boot_id + '，请勿当作当前开机的根因。');
 		var result = failure.result || {};
@@ -95,6 +172,14 @@ function reportSummary(logs) {
 		if (typeof output === 'string')
 			lines.push('- 原始命令输出：\n\n    ' + output.split('\n').join('\n    '));
 	}
+	history.failures.forEach(function(record) {
+		if (record === snapshotEvent)
+			return;
+		var event = record.event;
+		var error = event.core_code || (event.exit_code && '退出码 ' + event.exit_code);
+		var detail = [ event.source, event.stage || event.event, error ].filter(Boolean).join('，');
+		lines.push('- ' + (event.timestamp || '时间未知') + ' 接管操作失败（' + detail + '）。' + recoveryText(record.recovery));
+	});
 	var task = evidenceJSON(evidence.task_result);
 	if (task && task.ok === false)
 		lines.push('- 最近任务错误：' + (task.code || '') + ' ' + (task.message || ''));
@@ -107,11 +192,8 @@ function reportSummary(logs) {
 		lines.push('- 快照命令失败：' + logs.snapshot_errors.join('、') + '；原始 stderr 和退出码见下方完整诊断。');
 	if (logs.events_available === false)
 		lines.push('- 未取得接管事件文件，不能由当前状态重建此前发生的操作。');
-	var invalidEvents = logs.events.filter(function(line) {
-		try { JSON.parse(line); return false; } catch (e) { return true; }
-	});
-	if (invalidEvents.length)
-		lines.push('- 有 ' + invalidEvents.length + ' 条事件不是完整 JSON，原文已保留，无法据此补全事件。');
+	if (history.invalidEvents)
+		lines.push('- 有 ' + history.invalidEvents + ' 条事件不是完整 JSON，原文已保留，无法据此补全事件。');
 	Object.keys(evidence).forEach(function(name) {
 		var source = evidence[name];
 		if (!source.available || source.exit_code)
@@ -124,10 +206,10 @@ function reportSummary(logs) {
 	return lines.join('\n') + '\n\n';
 }
 
-function fullReport(logs) {
+function fullReport(logs, title) {
 	logs = publicReport(logs);
 	return [
-		'# localClash 网络接管诊断报告',
+		'# ' + (title || 'localClash 网络接管诊断报告'),
 		'- 采集时间：' + (logs.collected_at || '旧版 helper 未提供采集时间'),
 		'- 采集完整：' + logs.complete + '（表示证据采集情况，不表示网络健康）',
 		'- Boot ID：' + logs.boot_id,
@@ -148,31 +230,56 @@ function fullReport(logs) {
 	].join('\n');
 }
 
-function buildGitHubIssue(logs) {
+function issueFromReport(logs, issue) {
 	validateReport(logs);
-	var title = '[Takeover] 网络接管问题 - boot ' + logs.boot_id.slice(0, 8);
-	var instructions = [
-		'## 问题描述',
-		'<!-- 请补充发生时间、受影响设备、实际现象和预期行为。 -->',
-		'',
-		'## 触发操作',
-		'<!-- 例如开机、更新、启动并接管、应用接管、WAN 重新拨号。 -->',
-		'',
-		'## 完整诊断报告',
+	var title = issue.title + ' - boot ' + logs.boot_id.slice(0, 8);
+	var instructions = issue.instructions.concat([
+		'', '## 完整诊断报告',
 		'此草稿尚未包含诊断。请将 LuCI 下载的完整 .txt 报告拖入正文作为附件上传，确认附件已上传后再提交。请保留完整文件，不要为了正文长度删减日志。'
-	].join('\n');
+	]).join('\n');
 	// No diagnostics in the query string: paste the full report or attach its file.
 	return {
 		title: title,
-		url: GITHUB_NEW_ISSUE_URL + '?template=takeover-report.md&title=' + encodeURIComponent(title) + '&body=' + encodeURIComponent(instructions),
-		full_report: fullReport(logs),
-		filename: 'localclash-takeover-' + logs.boot_id.replace(/[^a-zA-Z0-9-]/g, '_') + '.txt'
+		url: GITHUB_NEW_ISSUE_URL + '?template=' + issue.kind + '-report.md&title=' + encodeURIComponent(title) + '&body=' + encodeURIComponent(instructions),
+		full_report: fullReport(logs, issue.reportTitle),
+		filename: 'localclash-' + issue.kind + '-' + logs.boot_id.replace(/[^a-zA-Z0-9-]/g, '_') + '.txt'
 	};
+}
+
+function buildGitHubIssue(logs) {
+	return issueFromReport(logs, {
+		kind: 'takeover',
+		title: '[Takeover] 网络接管问题',
+		instructions: [
+			'## 问题描述',
+			'<!-- 请补充发生时间、受影响设备、实际现象和预期行为。 -->',
+			'',
+			'## 触发操作',
+			'<!-- 例如开机、更新、启动并接管、应用接管、WAN 重新拨号。 -->'
+		]
+	});
+}
+
+function buildRuntimeGitHubIssue(logs, takeover) {
+	var observation = takeover && takeover.ok === true ? takeover.status : null;
+	return issueFromReport(Object.assign({}, logs, { runtime_observation: observation }), {
+		kind: 'runtime',
+		title: '[Runtime] 运行问题',
+		reportTitle: 'localClash 运行诊断报告',
+		instructions: [
+			'## 问题描述',
+			'<!-- 请补充发生时间、受影响设备和域名、实际现象及预期行为。 -->',
+			'',
+			'## 复现步骤',
+			'<!-- 请说明当时是域名解析失败、网页打开慢，还是连接后传输不畅。 -->'
+		]
+	});
 }
 
 return baseclass.extend({
 	validateReport: validateReport,
 	buildPublicReport: publicReport,
 	buildFullReport: fullReport,
-	buildGitHubIssue: buildGitHubIssue
+	buildGitHubIssue: buildGitHubIssue,
+	buildRuntimeGitHubIssue: buildRuntimeGitHubIssue
 });

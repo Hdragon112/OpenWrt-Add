@@ -99,6 +99,66 @@ const partialReport = report.buildFullReport(partial);
 for (const text of [ '不是完整 JSON', 'file_read_failed', '省略较早的 50 行', 'ORIGINAL_STDERR', '另一轮开机' ])
 	assert(partialReport.includes(text), text);
 
+function summaryOf(reportText) {
+	return reportText.slice(0, reportText.indexOf('<details'));
+}
+
+function hotplugEvent(second, event, fields) {
+	return JSON.stringify({
+		boot_id: fixture.boot_id, source: 'iface_hotplug',
+		timestamp: '2026-11-12T02:28:' + second + '+08:00', uptime_seconds: 500 + Number(second),
+		event, ...fields
+	});
+}
+
+const recoveryFixture = {
+	...fixture,
+	evidence: { last_failure: { available: false, exit_code: 1, reason: 'file_missing', lines: [] } },
+	events: [
+		hotplugEvent('13', 'repair_apply_finished', { event_id: '4206', result: 'failure', core_code: 'takeover_apply_verification_failed' }),
+		hotplugEvent('13', 'restore_finished', { event_id: '4206', result: 'failure', exit_code: '1' }),
+		hotplugEvent('14', 'restore_finished', { boot_id: 'another-boot', event_id: '9', result: 'already_effective' }),
+		hotplugEvent('15', 'restore_finished', { event_id: '5170', result: 'success', exit_code: '0' }),
+		hotplugEvent('16', 'worker_finished', { source: 'net_hotplug', result: 'success', exit_code: '0' }),
+		hotplugEvent('12', 'repair_apply_finished', { event_id: '100', result: 'success' }),
+		hotplugEvent('27', 'repair_apply_finished', { event_id: '6983', result: 'success' }),
+		hotplugEvent('28', 'restore_finished', { event_id: '6983', result: 'success', exit_code: '0' }),
+		hotplugEvent('30', 'restore_started', { event_id: '4206' }),
+		hotplugEvent('31', 'restore_finished', { event_id: '4206', result: 'failure', exit_code: '1' }),
+		hotplugEvent('32', 'runtime_restart_finished', { event_id: '6600', result: 'success', takeover_transition: 'preserved_inactive' }),
+		hotplugEvent('33', 'repair_apply_finished', { boot_id: 'another-boot', result: 'failure', core_code: 'other_boot_failure' }),
+		'{"event":',
+		'null'
+	]
+};
+
+for (const reportText of [
+	report.buildGitHubIssue(recoveryFixture).full_report,
+	report.buildRuntimeGitHubIssue(recoveryFixture, { ok: true, status: { effective: true } }).full_report
+]) {
+	const summary = summaryOf(reportText);
+	const failures = summary.split('\n').filter(line => line.includes('接管操作失败'));
+	assert.strictEqual(failures.length, 2, 'the hotplug wrapper repeats one failure and the next operation reuses the ID');
+	assert.match(failures[0], /02:28:31.*后续暂无接管恢复验证记录/);
+	assert.match(failures[1], /02:28:13.*takeover_apply_verification_failed.*02:28:27.*接管恢复并验证生效/);
+	assert(summary.includes('有 1 条事件不是完整 JSON'));
+	assert(!summary.includes('other_boot_failure'));
+}
+
+const snapshotRecovery = {
+	...recoveryFixture,
+	events: recoveryFixture.events.slice(0, 8),
+	evidence: { last_failure: file([ JSON.stringify({
+		boot_id: fixture.boot_id, source: 'iface_hotplug', event_id: '4206',
+		timestamp: '2026-11-12T02:28:13+08:00', stage: 'takeover_apply', exit_code: 1,
+		result: { ...originalError, code: 'takeover_apply_verification_failed' }
+	}) ]) }
+};
+const snapshotSummary = summaryOf(report.buildFullReport(snapshotRecovery));
+assert.match(snapshotSummary, /最近失败.*02:28:13.*02:28:27.*接管恢复并验证生效/);
+assert(!snapshotSummary.includes('接管操作失败'), 'the snapshot and the matching event describe one failure');
+assert(snapshotSummary.includes('END_OF_ERROR'));
+
 // Redact actual secrets, while retaining socket addresses and valid nested JSON.
 const secrets = structuredClone(fixture);
 secrets.evidence.task_result = file([
@@ -125,6 +185,32 @@ assert.strictEqual(JSON.parse(sanitized.events.at(-1)).token, '19330');
 assert(publicText.includes('http://127.0.0.1:9090/version'));
 assert.strictEqual(secrets.evidence.task_result.lines[2], '  "password": "private-password",', 'report generation must not mutate its evidence');
 
+const runtimeObservation = {
+	ok: true,
+	status: {
+		runtime_running: true, controller_ready: true,
+		dns: {
+			path: 'mihomo', lease_active: true, guard_reason: 'runtime_lease_refreshed',
+			probe: {
+				state: 'failed', observed_at: '2026-11-03T11:00:01+08:00', query: 'localclash-probe.google.com',
+				output: 'dns-probe: unhealthy rcode 2; https://example.test/private-path?token=probe-secret'
+			}
+		}
+	}
+};
+const runtimeIssue = report.buildRuntimeGitHubIssue(fixture, runtimeObservation);
+const runtimeIssueURL = new URL(runtimeIssue.url);
+assert.strictEqual(runtimeIssueURL.searchParams.get('template'), 'runtime-report.md');
+assert(runtimeIssueURL.searchParams.get('body').includes('域名解析失败'));
+assert(runtimeIssue.filename.startsWith('localclash-runtime-'));
+for (const evidence of [ '运行诊断报告', 'runtime_observation', 'runtime_lease_refreshed', 'localclash-probe.google.com', 'unhealthy rcode 2', 'END_OF_ERROR' ])
+	assert(runtimeIssue.full_report.includes(evidence), evidence);
+assert(!runtimeIssue.full_report.includes('probe-secret'));
+assert(!runtimeIssue.url.includes('localclash-probe.google.com'));
+assert(runtimeObservation.status.dns.probe.output.includes('probe-secret'));
+const stoppedObservation = { ok: true, status: { runtime_running: false, controller_ready: false } };
+assert(!report.buildRuntimeGitHubIssue(fixture, stoppedObservation).full_report.includes('控制器未响应'));
+
 function harness(payload) {
 	const nodes = {};
 	const state = { copied: [], windows: [], downloads: [], errors: [], modal: null, copyFails: false, popupBlocked: false };
@@ -139,7 +225,7 @@ function harness(payload) {
 		return node;
 	}
 	const apiSource = overview.slice(overview.indexOf('function takeoverIssueLogs()'), overview.indexOf('\nfunction mcpGuidanceBody')) +
-		'\nreturn { load: takeoverIssueLogs, show: showTakeoverReport, button: takeoverIssueReportButton };';
+		'\nreturn { load: takeoverIssueLogs, show: showTakeoverReport, button: takeoverIssueReportButton, runtimeButton: runtimeIssueReportButton };';
 	const api = new Function('callTakeoverLogs', 'takeoverIssueReport', 'copyText', 'ui', 'E', '_', 'window', 'document', 'URL', 'Blob', 'actionRow', 'showError', apiSource)(
 		async () => payload, report,
 		async text => { if (state.copyFails) throw new Error('clipboard denied'); state.copied.push(text); },
@@ -193,5 +279,17 @@ function harness(payload) {
 	buttons[2].attrs.click({ currentTarget: {} });
 	assert(h.nodes['localclash-takeover-report-status'].textContent.includes('阻止'));
 	assert(h.state.modal);
-	process.stdout.write('takeover complete report, redaction and delivery regressions passed\n');
+
+	const runtime = harness(fixture);
+	const button = runtime.api.runtimeButton(runtimeObservation);
+	await button.attrs.click({ preventDefault() {}, currentTarget: button });
+	assert.strictEqual(runtime.state.modal.title, '运行问题报告');
+	assert.strictEqual(runtime.nodes['localclash-runtime-report-preview'].value, runtimeIssue.full_report);
+	const runtimeButtons = runtime.state.modal.children.at(-1).children;
+	await runtimeButtons[0].attrs.click();
+	assert.strictEqual(runtime.state.copied[0], runtimeIssue.full_report);
+	runtimeButtons[2].attrs.click();
+	assert.strictEqual(runtime.state.windows.at(-1).url, runtimeIssue.url);
+	assert.strictEqual(await runtime.state.blob.text(), runtimeIssue.full_report);
+	process.stdout.write('takeover and runtime report, redaction and delivery regressions passed\n');
 })().catch(error => { process.stderr.write(error.stack + '\n'); process.exitCode = 1; });
